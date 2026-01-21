@@ -1,0 +1,28 @@
+[package]
+name = "sc_bltc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+hex = "0.4"
+num-complex = "0.4"
+rayon = "1.10"
+rubato = "0.15"
+rustfft = "6"
+
+# AES-CTR for long-code generation (RustCrypto).
+aes = "0.8"
+ctr = "0.9"
+cipher = "0.4"
+rand_distr = "0.5.1"
+
+[dev-dependencies]
+rand = "0.9"

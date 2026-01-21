@@ -1,0 +1,15 @@
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+build/
+dist/
+*.egg-info/
+*.jsonl
+target/
+
+# Github fails to render Latex, so we upload a PDF instead
+Specification.md
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md
