@@ -577,11 +577,23 @@ fn main() -> anyhow::Result<()> {
 
     let mp = if !args.mp_tap.is_empty() {
         let mut max_d = 0usize;
+        let mut min_d = usize::MAX;
+        let mut has_d0 = false;
         let mut entries: Vec<(usize, Complex32)> = Vec::with_capacity(args.mp_tap.len());
         for s in &args.mp_tap {
             let (d, g) = parse_mp_tap(s, &mut rng)?;
             max_d = max_d.max(d);
+            min_d = min_d.min(d);
+            has_d0 |= d == 0;
             entries.push((d, g));
+        }
+        if !has_d0 {
+            eprintln!(
+                "[tx_tcp][warn] mp_tap has no delay-0 direct path; earliest tap at {} samples (IV={} samples). \
+                 If you intended multipath, repeat --mp-tap and include e.g. --mp-tap 0,0.",
+                min_d,
+                iv_samples
+            );
         }
         let mut taps = vec![Complex32::new(0.0, 0.0); max_d + 1];
         for (d, g) in entries {
