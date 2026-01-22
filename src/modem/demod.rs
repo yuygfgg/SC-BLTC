@@ -111,14 +111,23 @@ impl ScBltcModem {
 
         let chip_step0 = dll.sym_step_samp / (p.sf as f64);
         let mut u0_fingers: Vec<Vec<Complex32>> = Vec::with_capacity(n_finger);
+        let mut u1_fingers: Vec<Vec<Complex32>> = Vec::with_capacity(n_finger);
         for i in 0..n_finger {
             let y0 = sample_symbol(t_sym0[i], chip_step0, 0.0)
                 .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
             u0_fingers.push(demask_symbol(&y0, 0));
+
+            // Spec §4.B / §4.C.
+            let y1 = sample_symbol(t_sym0[i] + sym_step_nom, chip_step0, 0.0)
+                .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
+            u1_fingers.push(demask_symbol(&y1, 1));
         }
-        let pre_corr: Vec<Complex32> = u0_fingers
-            .iter()
-            .map(|u| u.iter().copied().sum::<Complex32>())
+        let pre_corr: Vec<Complex32> = (0..n_finger)
+            .map(|i| {
+                let z0: Complex32 = u0_fingers[i].iter().copied().sum();
+                let z1: Complex32 = u1_fingers[i].iter().copied().sum();
+                z0 - z1
+            })
             .collect();
 
         let i_ref = pre_corr
@@ -130,10 +139,8 @@ impl ScBltcModem {
         let mut theta = pre_corr[i_ref].arg() as f64;
 
         let rot0 = Complex32::from_polar(1.0, -(theta as f32));
-        let mut g: Vec<Complex32> = pre_corr
-            .iter()
-            .map(|&z| (z / (p.sf as f32)) * rot0)
-            .collect();
+        let pre_den = (p.n_pre as f32) * (p.sf as f32);
+        let mut g: Vec<Complex32> = pre_corr.iter().map(|&z| (z / pre_den) * rot0).collect();
         if !(g.iter().all(|v| v.re.is_finite() && v.im.is_finite())
             && g.iter().map(|v| v.norm_sqr()).sum::<f32>() > 0.0)
         {
@@ -213,6 +220,15 @@ impl ScBltcModem {
                 u_p_fingers.push(demask_symbol(&y_p, ell));
             }
 
+            // Spec §3.D
+            if ell == 1 {
+                for u in &mut u_p_fingers {
+                    for v in u {
+                        *v = -*v;
+                    }
+                }
+            }
+
             let mut theta_sym = theta;
             let mut rot_chips = build_carrier_rot_chips(theta_sym, omega, p.sf);
             let mut u_p = vec![Complex32::new(0.0, 0.0); p.sf];
@@ -227,7 +243,7 @@ impl ScBltcModem {
             let mut dll_dd = false;
             let mut dll_m = 0usize;
 
-            if ell == 0 || is_pilot(ell) {
+            if ell < p.n_pre || is_pilot(ell) {
                 let mut z_p: Complex32 = u_p.iter().copied().sum();
 
                 // Cycle-slip guard.

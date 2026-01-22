@@ -26,6 +26,8 @@ pub struct Params {
 
     pub nfft_acq: usize,
     pub cfo_search_hz: f64,
+    pub gamma_hybrid_mult: f64,
+    pub rake_search_half_s: f64,
 }
 
 impl Default for Params {
@@ -37,10 +39,10 @@ impl Default for Params {
             sf: 1024,
             k_bits_per_sym: 8,
             mw: 256,
-            n_pre: 1,
+            n_pre: 2,
             n_data: 64,
             n_pilot: 16,
-            n_sym: 81,
+            n_sym: 82,
             ldpc_n: 512,
             ldpc_k: 256,
             iv_res_s: 0.001,
@@ -49,8 +51,10 @@ impl Default for Params {
             rrc_alpha: 0.25,
             rrc_span_symbols: 6,
             tx_ramp_ms: 20.0,
-            nfft_acq: 8192,
+            nfft_acq: 32768,
             cfo_search_hz: 8000.0,
+            gamma_hybrid_mult: 25.0,
+            rake_search_half_s: 0.004,
         }
     }
 }

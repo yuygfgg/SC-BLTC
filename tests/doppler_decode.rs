@@ -85,9 +85,12 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
         12345,
     );
 
-    // Acquisition needs only a shorter window.
-    let n_ref = p.chip_samples();
-    let win_need = n_ti * iv_samples + n_ref;
+    // Acquisition window must include all pilots for hybrid verification.
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq_win = &raw[..win_need];
     let acq = modem
         .acquire_fft_raw_window(acq_win, ti_min, n_ti, 1e-9, 3)?
@@ -103,7 +106,7 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
         ti_tx,
         frame_start_sample,
         &acq.finger_offsets,
-        acq.cfo_coarse_hz,
+        acq.cfo_hat_hz,
         20,
     )?;
 
@@ -136,20 +139,17 @@ fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
 
     let raw = apply_ou_doppler_and_awgn(&raw, fs, 0.0, 1.0, 1.0, 0.0, 12345);
 
-    let n_ref = p.chip_samples();
-    let win_need = n_ti * iv_samples + n_ref;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
         .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
-    let (payload, meta) = modem.demod_decode_raw(
-        &raw,
-        ti_tx,
-        base,
-        &acq.finger_offsets,
-        acq.cfo_coarse_hz,
-        20,
-    )?;
+    let (payload, meta) =
+        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, acq.cfo_hat_hz, 20)?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
@@ -180,20 +180,17 @@ fn test_decode_awgn_only() -> anyhow::Result<()> {
 
     let raw = apply_ou_doppler_and_awgn(&raw, fs, 0.0, 0.0, 1.0, 2.0, 12345);
 
-    let n_ref = p.chip_samples();
-    let win_need = n_ti * iv_samples + n_ref;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
         .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
-    let (payload, meta) = modem.demod_decode_raw(
-        &raw,
-        ti_tx,
-        base,
-        &acq.finger_offsets,
-        acq.cfo_coarse_hz,
-        20,
-    )?;
+    let (payload, meta) =
+        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, acq.cfo_hat_hz, 20)?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
@@ -225,22 +222,19 @@ fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
     let cfo_hz = 10.0;
     let raw = apply_ou_doppler_and_awgn(&raw, fs, cfo_hz, 0.0, 1.0, 0.0, 12345);
 
-    let n_ref = p.chip_samples();
-    let win_need = n_ti * iv_samples + n_ref;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
         .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
-    assert!((acq.cfo_coarse_hz - cfo_hz).abs() < 1.0, "acq={acq:?}");
+    assert!((acq.cfo_hat_hz - cfo_hz).abs() < 1.0, "acq={acq:?}");
 
-    let (payload, meta) = modem.demod_decode_raw(
-        &raw,
-        ti_tx,
-        base,
-        &acq.finger_offsets,
-        acq.cfo_coarse_hz,
-        20,
-    )?;
+    let (payload, meta) =
+        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, acq.cfo_hat_hz, 20)?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
@@ -272,8 +266,11 @@ fn test_decode_with_constant_cfo_without_derotation() -> anyhow::Result<()> {
     let cfo_hz = 2.0;
     let raw = apply_ou_doppler_and_awgn(&raw, fs, cfo_hz, 0.0, 1.0, 0.0, 12345);
 
-    let n_ref = p.chip_samples();
-    let win_need = n_ti * iv_samples + n_ref;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
         .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;

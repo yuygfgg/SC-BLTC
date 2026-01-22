@@ -38,7 +38,15 @@ impl ScBltcModem {
         let mut q = 0usize;
         for ell in 0..p.n_sym {
             let seg0 = ell * p.sf;
-            if ell == 0 || is_pilot(ell) {
+            if ell == 0 {
+                // Spec §3.D
+                s[seg0..seg0 + p.sf].copy_from_slice(&c_seq[seg0..seg0 + p.sf]);
+            } else if ell == 1 {
+                // Spec §3.D
+                for j in 0..p.sf {
+                    s[seg0 + j] = -c_seq[seg0 + j];
+                }
+            } else if is_pilot(ell) {
                 s[seg0..seg0 + p.sf].copy_from_slice(&c_seq[seg0..seg0 + p.sf]);
             } else {
                 let row = walsh_row(m[q] as u16, p.sf);
@@ -67,16 +75,25 @@ impl ScBltcModem {
     pub fn make_ref_preamble_matched(&self, ti_search: u64) -> Vec<Complex32> {
         // Spec §4.B.2 (local reference).
         let p = &self.p;
-        let c = gen_code_aes_ctr(&self.key, ti_search, p.sf, p.domain_u32);
+        let n_chips = p.n_pre * p.sf;
+        let mut c = gen_code_aes_ctr(&self.key, ti_search, n_chips, p.domain_u32);
+        // Spec §4.B.2: two-symbol Barker-2 preamble is [+C_seq, -C_seq] over the first 2*SF chips.
+        for j in p.sf..n_chips {
+            c[j] = -c[j];
+        }
         let x = pulse_shape_chips(&c, &self.rrc, p.osf as usize);
         let y = self.rrc.filter_same(&x);
-        y[..p.chip_samples()].to_vec()
+        y[..(p.n_pre * p.chip_samples())].to_vec()
     }
 
     pub fn make_ref_preamble_tx_shaped(&self, ti_search: u64) -> Vec<Complex32> {
         let p = &self.p;
-        let c = gen_code_aes_ctr(&self.key, ti_search, p.sf, p.domain_u32);
+        let n_chips = p.n_pre * p.sf;
+        let mut c = gen_code_aes_ctr(&self.key, ti_search, n_chips, p.domain_u32);
+        for j in p.sf..n_chips {
+            c[j] = -c[j];
+        }
         let x = pulse_shape_chips(&c, &self.rrc, p.osf as usize);
-        x[..p.chip_samples()].to_vec()
+        x[..(p.n_pre * p.chip_samples())].to_vec()
     }
 }

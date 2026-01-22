@@ -13,16 +13,20 @@ fn test_acquire_on_noise() {
 
     let fs = p.fs_hz as f64;
     let iv_samples = (fs * p.iv_res_s).round() as usize;
-    let n_ref = p.chip_samples();
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
 
     let n_ti = 1;
-    let window_len = n_ti * iv_samples + n_ref;
+    let window_len = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
 
     let mut rng = StdRng::seed_from_u64(0);
+    let n01 = Normal::<f32>::new(0.0, 1.0).unwrap();
     let noise: Vec<Complex32> = (0..window_len)
         .map(|_| {
-            let re: f32 = rng.random_range(-1.0..1.0);
-            let im: f32 = rng.random_range(-1.0..1.0);
+            let re: f32 = n01.sample(&mut rng);
+            let im: f32 = n01.sample(&mut rng);
             Complex32::new(re, im)
         })
         .collect();
@@ -43,12 +47,15 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let cfo_hz: f64 = 50.0;
 
     let t_tx = 4000.0f64 + 0.00037;
-    let ti_tx = (t_tx / p.iv_res_s).floor() as u64;
-    let ref0 = modem.make_ref_preamble_tx_shaped(ti_tx);
+    let frame = modem.build_frame_samples(b"t", 1, 1, Some(t_tx))?;
+    let ti_tx = frame.ti_tx;
 
     let fs = p.fs_hz as f64;
     let iv_samples = (fs * p.iv_res_s).round() as usize;
-    let n_ref = p.chip_samples();
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
 
     let ti_min = ti_tx.saturating_sub(2);
     let n_ti = 5usize;
@@ -57,23 +64,23 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let n0 = (frac * fs).round() as usize % iv_samples;
     let pre = base + n0;
 
-    let win_need = n_ti * iv_samples + n_ref;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let mut raw = vec![Complex32::new(0.0, 0.0); win_need];
 
     let mut rng = StdRng::seed_from_u64(1);
     let n01 = Normal::<f32>::new(0.0, noise_std)?;
+    for s in &mut raw {
+        *s = Complex32::new(n01.sample(&mut rng), n01.sample(&mut rng));
+    }
+
+    let sig_need = (last_pilot_end + 32).min(frame.samples.len());
+    raw[pre..pre + sig_need].copy_from_slice(&frame.samples[..sig_need]);
+
+    // Apply a global CFO rotation to the entire window (signal + noise).
     let dphi = (2.0 * std::f64::consts::PI * cfo_hz / fs) as f32;
     let mut phi = 0.0f32;
     for s in &mut raw {
-        *s = Complex32::new(n01.sample(&mut rng), n01.sample(&mut rng))
-            * Complex32::from_polar(1.0, phi);
-        phi += dphi;
-    }
-
-    phi = (pre as f32) * dphi;
-    for (k, &x) in ref0.iter().enumerate() {
-        let rot = Complex32::from_polar(1.0, phi);
-        raw[pre + k] += x * rot;
+        *s *= Complex32::from_polar(1.0, phi);
         phi += dphi;
     }
 
@@ -84,7 +91,7 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}, ti_tx={ti_tx}");
     assert_eq!(acq.n0, n0, "acq={acq:?}, n0_true={n0}");
     assert!(
-        (acq.cfo_coarse_hz - cfo_hz).abs() <= 5.0,
+        (acq.cfo_hat_hz - cfo_hz).abs() <= 5.0,
         "acq={acq:?}, cfo_true={cfo_hz}"
     );
     Ok(())
@@ -99,12 +106,31 @@ fn test_key_mismatch() {
     let modem_a = ScBltcModem::new(p.clone(), key_a).unwrap();
     let modem_b = ScBltcModem::new(p.clone(), key_b).unwrap();
 
-    let t_tx = 1000.0;
+    let t_tx = 1000.0f64;
     let tx_frame = modem_a
         .build_frame_samples(b"test", 1, 1, Some(t_tx))
         .unwrap();
 
-    let rx_raw = tx_frame.samples;
+    let ti_tx = tx_frame.ti_tx;
+    let fs = p.fs_hz as f64;
+    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let frac = t_tx - (ti_tx as f64) * p.iv_res_s;
+    let n0 = (frac * fs).round() as usize % iv_samples;
+
+    let ti_min = ti_tx.saturating_sub(2);
+    let n_ti = 5usize;
+    let base = ((ti_tx - ti_min) as usize) * iv_samples;
+    let pre = base + n0;
+
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+
+    let mut rx_raw = vec![Complex32::new(0.0, 0.0); win_need];
+    let sig_need = (last_pilot_end + 32).min(tx_frame.samples.len());
+    rx_raw[pre..pre + sig_need].copy_from_slice(&tx_frame.samples[..sig_need]);
     let mut rng = StdRng::seed_from_u64(2);
     let rx_noisy: Vec<Complex32> = rx_raw
         .iter()
@@ -115,14 +141,8 @@ fn test_key_mismatch() {
         })
         .collect();
 
-    let rx_matched = modem_b.rrc.filter_same(&rx_noisy);
-
-    let ti = tx_frame.ti_tx;
-    let n_ti = 5;
-    let ti_min = ti - 2;
-
     let result = modem_b
-        .acquire_fft_matched_window(&rx_matched, ti_min, n_ti, 1e-3, 3)
+        .acquire_fft_raw_window(&rx_noisy, ti_min, n_ti, 1e-3, 3)
         .unwrap();
     assert!(result.is_none(), "acquired with wrong key: {result:?}");
 }

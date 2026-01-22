@@ -167,9 +167,18 @@ fn main() -> anyhow::Result<()> {
 
     let fs = p.fs_hz as f64;
     let iv_samples = ((p.fs_hz as f64) * p.iv_res_s).round() as u64;
-    let preamble_len = p.chip_samples() as u64;
-    // Spec §4.B.1.
-    let acq_guard_samples = preamble_len + iv_samples;
+    let l_sym = p.chip_samples() as u64;
+    // Spec §4.B
+    let ell_last_pilot = 2u64 + 5u64 * (p.n_pilot.saturating_sub(1) as u64);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let pilot_timing_win: u64 = 32;
+    let rake_search_half_samples: u64 =
+        ((p.fs_hz as f64) * p.rake_search_half_s).round().max(0.0) as u64;
+    // Spec §4.B.1
+    // Spec §4.B.3
+    let acq_guard_samples =
+        last_pilot_end + pilot_timing_win + iv_samples + rake_search_half_samples;
+    let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
 
     let cap_samples = (args.buffer_sec.max(1.0) * fs).round() as usize;
     let mut ring = Ring::<Complex32>::new(cap_samples);
@@ -240,12 +249,14 @@ fn main() -> anyhow::Result<()> {
                 0.0
             };
             eprintln!(
-                "[rx_tcp][dbg] ring: len={} (base={}, next={}), raw_avg_power={:.3e}, stash_rem_bytes={}",
+                "[rx_tcp][dbg] ring: len={} (base={}, next={}), raw_avg_power={:.3e}, stash_rem_bytes={}, acq_ready={} (acq_tail_samples={})",
                 ring.len(),
                 ring.abs_base,
                 ring.abs_next,
                 pwr_avg,
-                stash.len()
+                stash.len(),
+                ring.len() >= acq_tail_samples,
+                acq_tail_samples
             );
             dbg_samp = 0;
             dbg_pwr_sum = 0.0;
@@ -321,17 +332,25 @@ fn main() -> anyhow::Result<()> {
         }
 
         if last_acq.elapsed() >= Duration::from_millis(args.acq_interval_ms)
-            && ring.len() > preamble_len + iv_samples
+            && ring.len() > acq_tail_samples
         {
             last_acq = Instant::now();
             let Some(t0) = t0_s else { continue };
 
-            let t_latest = t0 + ((ring.abs_next.saturating_sub(acq_guard_samples)) as f64) / fs;
+            let t_latest = t0 + ((ring.abs_next.saturating_sub(acq_tail_samples)) as f64) / fs;
             let ti_latest_i = (t_latest / p.iv_res_s).floor() as i64;
             let ti_earliest_i = ((t0 + (ring.abs_base as f64) / fs) / p.iv_res_s).ceil() as i64;
 
-            let ti_latest = ti_latest_i.max(ti_earliest_i).max(0) as u64;
-            let ti_earliest = ti_earliest_i.max(0) as u64;
+            let ti_latest = ti_latest_i.max(0) as u64;
+            let mut ti_earliest = ti_earliest_i.max(0) as u64;
+            if ti_latest < ti_earliest {
+                search_cursor_ti = Some(ti_earliest);
+                continue;
+            }
+
+            let w_ti = ((args.w_sec / p.iv_res_s).ceil().max(1.0)) as u64;
+            let ti_floor = ti_latest.saturating_sub(w_ti);
+            ti_earliest = ti_earliest.max(ti_floor);
 
             if search_cursor_ti.is_none() {
                 search_cursor_ti = Some(ti_earliest);
@@ -353,19 +372,44 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            let max_batch = 5000;
+            let max_batch = 5000u64;
             let mut ti_end = next_ti + max_batch;
             if ti_end > ti_latest {
                 ti_end = ti_latest;
             }
 
-            let n_ti = (ti_end - next_ti + 1) as usize;
-
             let n_start_f = ((next_ti as f64) * p.iv_res_s - t0) * fs;
             let n_start = n_start_f.round().max(0.0) as u64;
+
+            if n_start < ring.abs_base {
+                let delta_samp = ring.abs_base - n_start;
+                let delta_ti = (delta_samp + iv_samples - 1) / iv_samples;
+                search_cursor_ti = Some(next_ti.saturating_add(delta_ti));
+                continue;
+            }
+
+            if n_start.saturating_add(acq_tail_samples) > ring.abs_next {
+                search_cursor_ti = Some(next_ti);
+                continue;
+            }
+
+            let max_n_ti_by_end = {
+                let slack = ring
+                    .abs_next
+                    .saturating_sub(n_start)
+                    .saturating_sub(acq_guard_samples);
+                (slack / iv_samples).max(1)
+            };
+            let mut n_ti = (ti_end - next_ti + 1) as u64;
+            if n_ti > max_n_ti_by_end {
+                n_ti = max_n_ti_by_end;
+                ti_end = next_ti + n_ti - 1;
+            }
+            let n_ti = n_ti as usize;
+
             let win_len = (n_ti as u64)
                 .saturating_mul(iv_samples)
-                .saturating_add(preamble_len) as usize;
+                .saturating_add(acq_guard_samples) as usize;
 
             let Some(y_win) = ring.get_vec(n_start, win_len) else {
                 if args.debug {
@@ -385,6 +429,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
+            let backlog_before_s = (ti_latest.saturating_sub(next_ti) as f64) * p.iv_res_s;
             let t_acq0 = Instant::now();
             match modem.acquire_fft_raw_window(
                 &y_win,
@@ -396,8 +441,10 @@ fn main() -> anyhow::Result<()> {
                 Ok(Some(acq)) => {
                     if last_decoded_ti != Some(acq.ti_hat) {
                         let base_abs = n_start + ((acq.ti_hat - next_ti) as u64) * iv_samples;
+                        let max_off =
+                            acq.finger_offsets.iter().copied().max().unwrap_or(acq.n0) as u64;
                         let decode_need_abs = base_abs
-                            + (iv_samples.saturating_sub(1))
+                            + max_off
                             + (p.frame_samples_with_tail() as u64)
                             + (4 * modem.rrc.delay() as u64)
                             + 256;
@@ -408,7 +455,7 @@ fn main() -> anyhow::Result<()> {
                             ti: acq.ti_hat,
                             base_abs,
                             offsets: acq.finger_offsets,
-                            cfo_hz: acq.cfo_coarse_hz,
+                            cfo_hz: acq.cfo_hat_hz,
                             p_max: acq.p_max,
                             need_abs: decode_need_abs,
                         };
@@ -423,7 +470,7 @@ fn main() -> anyhow::Result<()> {
                                     acq.ti_hat,
                                     acq.n0,
                                     acq.p_max,
-                                    acq.cfo_coarse_hz,
+                                    acq.cfo_hat_hz,
                                     cand.offsets,
                                     base_abs,
                                     decode_in_s
@@ -434,7 +481,7 @@ fn main() -> anyhow::Result<()> {
                                     acq.ti_hat,
                                     acq.n0,
                                     acq.p_max,
-                                    acq.cfo_coarse_hz,
+                                    acq.cfo_hat_hz,
                                     cand.offsets,
                                     base_abs,
                                     decode_in_s
@@ -461,6 +508,21 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     eprintln!("[rx_tcp] acq error: {e:#}");
                 }
+            }
+            if args.debug {
+                let elapsed_s = t_acq0.elapsed().as_secs_f64();
+                let span_s = (n_ti as f64) * p.iv_res_s;
+                let speed_x = if elapsed_s > 0.0 {
+                    span_s / elapsed_s
+                } else {
+                    f64::INFINITY
+                };
+                let backlog_after_s =
+                    (ti_latest.saturating_sub(ti_end.saturating_add(1)) as f64) * p.iv_res_s;
+                eprintln!(
+                    "[rx_tcp][dbg] acq realtime: span={:.3}s, elapsed={:.3}s, speed={:.2}x, backlog={:.3}s -> {:.3}s",
+                    span_s, elapsed_s, speed_x, backlog_before_s, backlog_after_s
+                );
             }
             search_cursor_ti = Some(ti_end + 1);
         }

@@ -2,7 +2,8 @@ use crate::rrc::Fir;
 use num_complex::Complex32;
 
 pub(super) fn is_pilot(ell: usize) -> bool {
-    ell >= 1 && ((ell - 1) % 5 == 0)
+    // Spec §3 / §4: pilots start after the 2-symbol preamble.
+    ell >= 2 && ((ell - 2) % 5 == 0)
 }
 
 pub(super) fn wrap_pm_pi(x: f64) -> f64 {

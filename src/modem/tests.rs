@@ -74,7 +74,11 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
 
     let y = modem.rrc.filter_same(&raw);
     let n_ti = 5usize;
-    let win_need = n_ti * iv_samples + p.chip_samples();
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = ((p.fs_hz as f64) * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let y_win = &y[..win_need];
 
     let acq = modem
@@ -88,7 +92,7 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
         acq.ti_hat,
         base,
         &acq.finger_offsets,
-        acq.cfo_coarse_hz,
+        acq.cfo_hat_hz,
         80,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
@@ -123,7 +127,11 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
     }));
 
     let n_ti = 5usize;
-    let win_need = n_ti * iv_samples + p.chip_samples();
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = ((p.fs_hz as f64) * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let x_win = &raw[..win_need];
 
     let acq = modem
@@ -131,14 +139,14 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx);
     assert!((acq.n0 as isize - n0 as isize).abs() <= 3, "acq={acq:?}");
-    assert!((acq.cfo_coarse_hz - cfo_hz).abs() <= 50.0, "acq={acq:?}");
+    assert!((acq.cfo_hat_hz - cfo_hz).abs() <= 50.0, "acq={acq:?}");
 
     let (pl, meta) = modem.demod_decode_raw(
         &raw,
         acq.ti_hat,
         base,
         &acq.finger_offsets,
-        acq.cfo_coarse_hz,
+        acq.cfo_hat_hz,
         80,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
@@ -211,7 +219,11 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
     }
 
     let n_ti = 5usize;
-    let win_need = n_ti * iv_samples + p.chip_samples();
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = ((p.fs_hz as f64) * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let x_win = &raw[..win_need];
 
     let acq = modem
@@ -225,7 +237,93 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
         acq.ti_hat,
         base,
         &acq.finger_offsets,
-        acq.cfo_coarse_hz,
+        acq.cfo_hat_hz,
+        120,
+    )?;
+    assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
+    assert_eq!(pl.unwrap(), payload);
+    Ok(())
+}
+
+#[test]
+fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
+    let p = Params::default();
+    let modem = ScBltcModem::new(p.clone(), [0u8; 32])?;
+
+    let path1_amp: f32 = 1.0;
+    let path2_amp: f32 = 0.9;
+    let noise_std: f32 = 0.15;
+
+    let fs = p.fs_hz as f64;
+    let t_tx = 7000.0f64 + 18.0 / fs;
+    let payload = b"mpath";
+    let frame = modem.build_frame_samples(payload, 1, 1, Some(t_tx))?;
+
+    let ti_tx = frame.ti_tx;
+    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let frac = t_tx - (ti_tx as f64) * p.iv_res_s;
+    let n0 = (frac * fs).round() as usize % iv_samples;
+
+    let ti_min = ti_tx.saturating_sub(2);
+    let base = ((ti_tx - ti_min) as usize) * iv_samples;
+    let pre = base + n0;
+
+    // Delay the second path beyond one IV but still within the default RAKE search window.
+    let path2_delay_samples: usize = iv_samples + 50;
+
+    let mut signal = vec![Complex32::new(0.0, 0.0); pre];
+    signal.extend_from_slice(&frame.samples);
+    signal.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 512));
+
+    let n_samples = signal.len();
+    let mut raw = vec![Complex32::new(0.0, 0.0); n_samples];
+    for n in 0..n_samples {
+        let x1 = signal[n] * path1_amp;
+        let x2 = if n >= path2_delay_samples {
+            signal[n - path2_delay_samples] * path2_amp
+        } else {
+            Complex32::new(0.0, 0.0)
+        };
+        raw[n] = x1 + x2;
+    }
+
+    let mut rng = StdRng::seed_from_u64(2);
+    let n = Normal::<f32>::new(0.0, noise_std)?;
+    for x in &mut raw {
+        *x += Complex32::new(n.sample(&mut rng), n.sample(&mut rng));
+    }
+
+    let n_ti = 5usize;
+    let l_sym = p.chip_samples();
+    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+    let x_win = &raw[..win_need];
+
+    let acq = modem
+        .acquire_fft_raw_window(x_win, ti_min, n_ti, 1e-3, 3)?
+        .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
+    assert_eq!(acq.ti_hat, ti_tx);
+    assert!((acq.n0 as isize - n0 as isize).abs() <= 3, "acq={acq:?}");
+
+    let want = n0 + path2_delay_samples;
+    assert!(
+        acq.finger_offsets
+            .iter()
+            .any(|&off| (off as isize - want as isize).abs() <= 2),
+        "expected a finger near {}, got {:?} (n0={})",
+        want,
+        acq.finger_offsets,
+        n0
+    );
+
+    let (pl, meta) = modem.demod_decode_raw(
+        &raw,
+        acq.ti_hat,
+        base,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
         120,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
