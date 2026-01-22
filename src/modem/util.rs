@@ -10,31 +10,6 @@ pub(super) fn wrap_pm_pi(x: f64) -> f64 {
     (x + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI
 }
 
-pub(super) fn pll_step(
-    theta: &mut f64,
-    omega: &mut f64,
-    err: f64,
-    dd: bool,
-    kp: f64,
-    ki: f64,
-    omega_lim: f64,
-) {
-    let scale = if dd { 0.5 } else { 1.0 };
-    *omega = (*omega + (ki * scale) * err).clamp(-omega_lim, omega_lim);
-    *theta = wrap_pm_pi(*theta + *omega + (kp * scale) * err);
-}
-
-pub(super) fn build_carrier_rot_chips(theta: f64, omega: f64, sf: usize) -> Vec<Complex32> {
-    let mut rot = Vec::with_capacity(sf);
-    let dphi = -(omega as f32) / (sf as f32);
-    let mut ph = -(theta as f32);
-    for _ in 0..sf {
-        rot.push(Complex32::from_polar(1.0, ph));
-        ph += dphi;
-    }
-    rot
-}
-
 pub(super) fn bits_to_symbols(bits: &[u8], k: usize) -> Vec<u16> {
     assert!(bits.len() % k == 0);
     let mut out = Vec::with_capacity(bits.len() / k);

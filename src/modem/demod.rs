@@ -1,4 +1,4 @@
-use super::util::{build_carrier_rot_chips, derotate_cfo_in_place, is_pilot, pll_step, wrap_pm_pi};
+use super::util::{derotate_cfo_in_place, is_pilot, wrap_pm_pi};
 use super::{DecodeMeta, ScBltcModem};
 use crate::crypto::gen_code_aes_ctr;
 use crate::frame::parse_u_bits;
@@ -167,27 +167,30 @@ impl ScBltcModem {
         let mut w_mrc = mrc_weights(&g);
 
         let phase_err = |z: Complex32| -> f64 { (z.im as f64).atan2((z.re as f64) + 1e-18) };
-        let omega_err_from_halves = |u_prompt: &[Complex32]| -> Option<f64> {
-            let n = u_prompt.len();
-            if n < 4 {
-                return None;
-            }
-            let mid = n / 2;
-            let z0: Complex32 = u_prompt[..mid].iter().copied().sum();
-            let z1: Complex32 = u_prompt[mid..].iter().copied().sum();
-            if !(z0.norm() > 1e-6 && z1.norm() > 1e-6) {
-                return None;
-            }
-            let dphi = wrap_pm_pi((z1.arg() - z0.arg()) as f64);
-            Some(2.0 * dphi)
-        };
+        // Frequency-hypothesis bank around PLL ω.
+        let bank_half_hz = 4.0f64;
+        let bank_step_hz = 0.25f64;
+        let bank_k = (bank_half_hz / bank_step_hz).round() as i32;
+        let bank_dhz: Vec<f64> = (-bank_k..=bank_k)
+            .map(|k| (k as f64) * bank_step_hz)
+            .collect();
+        let bank_domega: Vec<f64> = bank_dhz
+            .iter()
+            .map(|&df_hz| 2.0 * std::f64::consts::PI * df_hz * tsym)
+            .collect();
 
-        let best_and_conf = |r_all: &[Complex32]| -> (usize, f32) {
+        // If the bank persistently prefers a non-zero Δf, snap ω toward that bin (PLL re-acquire).
+        let freq_snap_confirm = 3usize;
+        let freq_snap_min_abs_hz = 0.75f64;
+        let mut snap_cand_hz: Option<f64> = None;
+        let mut snap_count: usize = 0;
+
+        let best_and_conf_mag = |r_all: &[Complex32]| -> (usize, f32) {
             let mut best_i = 0usize;
             let mut best_v = f32::NEG_INFINITY;
             let mut second = f32::NEG_INFINITY;
             for (i, &v) in r_all[..p.mw].iter().enumerate() {
-                let d = v.re;
+                let d = v.norm_sqr();
                 if d > best_v {
                     second = best_v;
                     best_v = d;
@@ -200,6 +203,16 @@ impl ScBltcModem {
             (best_i, conf)
         };
 
+        // Split PLL update into predict (always advance θ by ω_used) and optional PI correction.
+        let pll_predict = |theta: &mut f64, omega_used: f64| {
+            *theta = wrap_pm_pi(*theta + omega_used);
+        };
+        let pll_correct = |theta: &mut f64, omega: &mut f64, err: f64, dd: bool| {
+            let scale = if dd { 0.5 } else { 1.0 };
+            *omega = (*omega + (ki * scale) * err).clamp(-omega_lim, omega_lim);
+            *theta = wrap_pm_pi(*theta + (kp * scale) * err);
+        };
+
         let mut pre_u = vec![Complex32::new(0.0, 0.0); p.sf];
         let rot_theta0 = Complex32::from_polar(1.0, -(theta as f32));
         for i in 0..n_finger {
@@ -208,6 +221,21 @@ impl ScBltcModem {
             }
         }
         let pre_mag_ref = pre_u.iter().copied().sum::<Complex32>().norm() + 1e-18;
+
+        let mut rot_tmp = vec![Complex32::new(0.0, 0.0); p.sf];
+        let mut rot_best = vec![Complex32::new(0.0, 0.0); p.sf];
+        let mut u_tmp = vec![Complex32::new(0.0, 0.0); p.sf];
+        let mut u_best = vec![Complex32::new(0.0, 0.0); p.sf];
+        let mut r_tmp = vec![Complex32::new(0.0, 0.0); p.sf];
+        let mut r_best = vec![Complex32::new(0.0, 0.0); p.sf];
+        let fill_rot_chips = |rot: &mut [Complex32], theta: f64, omega: f64| {
+            let dphi = -(omega as f32) / (p.sf as f32);
+            let mut ph = -(theta as f32);
+            for v in rot.iter_mut() {
+                *v = Complex32::from_polar(1.0, ph);
+                ph += dphi;
+            }
+        };
 
         let mut q_data = 0usize;
         for ell in 0..p.n_sym {
@@ -229,24 +257,46 @@ impl ScBltcModem {
                 }
             }
 
-            let mut theta_sym = theta;
-            let mut rot_chips = build_carrier_rot_chips(theta_sym, omega, p.sf);
-            let mut u_p = vec![Complex32::new(0.0, 0.0); p.sf];
-            for j in 0..p.sf {
-                let rotj = rot_chips[j];
-                for i in 0..n_finger {
-                    u_p[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
-                }
-            }
+            let theta_sym = theta;
+            let mut omega_used = omega;
+            let mut best_dhz = 0.0f64;
+            let freq_conf: f32;
 
             let mut dll_do_update = false;
             let mut dll_dd = false;
             let mut dll_m = 0usize;
 
             if ell < p.n_pre || is_pilot(ell) {
-                let mut z_p: Complex32 = u_p.iter().copied().sum();
+                let mut best_v = f32::NEG_INFINITY;
+                let mut second = f32::NEG_INFINITY;
+                for (h, &domega) in bank_domega.iter().enumerate() {
+                    let omega_h = (omega + domega).clamp(-omega_lim, omega_lim);
+                    fill_rot_chips(&mut rot_tmp, theta_sym, omega_h);
+
+                    u_tmp.fill(Complex32::new(0.0, 0.0));
+                    for j in 0..p.sf {
+                        let rotj = rot_tmp[j];
+                        for i in 0..n_finger {
+                            u_tmp[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
+                        }
+                    }
+                    let z: Complex32 = u_tmp.iter().copied().sum();
+                    let m = z.norm_sqr();
+                    if m > best_v {
+                        second = best_v;
+                        best_v = m;
+                        omega_used = omega_h;
+                        best_dhz = bank_dhz[h];
+                        rot_best.clone_from(&rot_tmp);
+                        u_best.clone_from(&u_tmp);
+                    } else if m > second {
+                        second = m;
+                    }
+                }
+                freq_conf = (best_v - second) / (best_v.abs() + 1e-18);
 
                 // Cycle-slip guard.
+                let mut z_p: Complex32 = u_best.iter().copied().sum();
                 if (z_p.re as f64) < 0.0 && z_p.norm() > 0.25 * pre_mag_ref {
                     theta = wrap_pm_pi(theta + std::f64::consts::PI);
                     for gi in &mut g {
@@ -254,45 +304,28 @@ impl ScBltcModem {
                     }
                     w_mrc = mrc_weights(&g);
 
-                    theta_sym = theta;
-                    rot_chips = build_carrier_rot_chips(theta_sym, omega, p.sf);
-                    u_p.fill(Complex32::new(0.0, 0.0));
+                    fill_rot_chips(&mut rot_best, theta, omega_used);
+                    u_best.fill(Complex32::new(0.0, 0.0));
                     for j in 0..p.sf {
-                        let rotj = rot_chips[j];
+                        let rotj = rot_best[j];
                         for i in 0..n_finger {
-                            u_p[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
+                            u_best[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
                         }
                     }
+                    z_p = u_best.iter().copied().sum();
                 }
-
-                // Pilot-aided FLL (W0): refine ω using within-symbol phase slope.
-                for _ in 0..2 {
-                    let Some(omega_err) = omega_err_from_halves(&u_p) else {
-                        break;
-                    };
-                    let fll_gain = 0.8;
-                    omega = (omega + fll_gain * omega_err).clamp(-omega_lim, omega_lim);
-                    rot_chips = build_carrier_rot_chips(theta_sym, omega, p.sf);
-                    u_p.fill(Complex32::new(0.0, 0.0));
-                    for j in 0..p.sf {
-                        let rotj = rot_chips[j];
-                        for i in 0..n_finger {
-                            u_p[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
-                        }
-                    }
-                }
-                z_p = u_p.iter().copied().sum();
 
                 let err = phase_err(z_p);
+                pll_predict(&mut theta, omega_used);
                 if err.is_finite() && z_p.norm() > 1e-6 {
-                    pll_step(&mut theta, &mut omega, err, false, kp, ki, omega_lim);
+                    pll_correct(&mut theta, &mut omega, err, false);
                 }
 
                 if is_pilot(ell) {
                     for i in 0..n_finger {
                         let mut z_i = Complex32::new(0.0, 0.0);
                         for j in 0..p.sf {
-                            z_i += u_p_fingers[i][j] * rot_chips[j];
+                            z_i += u_p_fingers[i][j] * rot_best[j];
                         }
                         let gi_meas = z_i / (p.sf as f32);
                         g[i] = g[i] * (1.0 - alpha_ch as f32) + gi_meas * (alpha_ch as f32);
@@ -304,54 +337,63 @@ impl ScBltcModem {
                 dll_dd = false;
                 dll_m = 0;
             } else {
-                let mut r_all = u_p.clone();
-                fht1024_in_place(&mut r_all);
-                let (mut best_i, mut conf) = best_and_conf(&r_all);
+                let mut best_i = 0usize;
+                let mut best_v = f32::NEG_INFINITY;
+                let mut second = f32::NEG_INFINITY;
+                let mut best_code_conf = 0.0f32;
+                for (h, &domega) in bank_domega.iter().enumerate() {
+                    let omega_h = (omega + domega).clamp(-omega_lim, omega_lim);
+                    fill_rot_chips(&mut rot_tmp, theta_sym, omega_h);
 
-                // Decision-directed FLL: refine ω using the decided prompt stream.
-                if conf.is_finite() && conf > 0.10 {
-                    let wrow = walsh_row(best_i as u16, p.sf);
-                    let mid = p.sf / 2;
-                    let mut z0 = Complex32::new(0.0, 0.0);
-                    let mut z1 = Complex32::new(0.0, 0.0);
-                    for j in 0..mid {
-                        z0 += u_p[j] * (wrow[j] as f32);
-                    }
-                    for j in mid..p.sf {
-                        z1 += u_p[j] * (wrow[j] as f32);
-                    }
-                    if z0.norm() > 1e-6 && z1.norm() > 1e-6 {
-                        let dphi = wrap_pm_pi((z1.arg() - z0.arg()) as f64);
-                        let omega_err = 2.0 * dphi;
-                        let fll_gain = 0.5;
-                        omega = (omega + fll_gain * omega_err).clamp(-omega_lim, omega_lim);
-
-                        rot_chips = build_carrier_rot_chips(theta_sym, omega, p.sf);
-                        u_p.fill(Complex32::new(0.0, 0.0));
-                        for j in 0..p.sf {
-                            let rotj = rot_chips[j];
-                            for i in 0..n_finger {
-                                u_p[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
-                            }
+                    u_tmp.fill(Complex32::new(0.0, 0.0));
+                    for j in 0..p.sf {
+                        let rotj = rot_tmp[j];
+                        for i in 0..n_finger {
+                            u_tmp[j] += w_mrc[i] * (u_p_fingers[i][j] * rotj);
                         }
-
-                        r_all.clone_from(&u_p);
-                        fht1024_in_place(&mut r_all);
-                        (best_i, conf) = best_and_conf(&r_all);
+                    }
+                    r_tmp.clone_from(&u_tmp);
+                    fht1024_in_place(&mut r_tmp);
+                    let (i_h, conf_h) = best_and_conf_mag(&r_tmp);
+                    let m = r_tmp[i_h].norm_sqr();
+                    if m > best_v {
+                        second = best_v;
+                        best_v = m;
+                        omega_used = omega_h;
+                        best_dhz = bank_dhz[h];
+                        best_i = i_h;
+                        best_code_conf = conf_h;
+                        rot_best.clone_from(&rot_tmp);
+                        r_best.clone_from(&r_tmp);
+                    } else if m > second {
+                        second = m;
                     }
                 }
+                freq_conf = (best_v - second) / (best_v.abs() + 1e-18);
+                // Gate PLL/DD only on code confidence; freq_conf can be flat even when code is OK.
+                let data_conf = best_code_conf;
 
-                let r256 = r_all[..p.mw].to_vec();
+                let r256 = r_best[..p.mw].to_vec();
                 r_data_all.push(r256);
 
-                if conf.is_finite() && conf > 0.10 {
-                    let mut z_dd = r_all[best_i];
+                pll_predict(&mut theta, omega_used);
+                if data_conf.is_finite() && data_conf > 0.10 {
+                    let mut z_dd = r_best[best_i];
                     if z_dd.re < 0.0 {
                         z_dd = -z_dd;
                     }
                     let err = phase_err(z_dd);
                     if err.is_finite() && z_dd.norm() > 1e-6 {
-                        pll_step(&mut theta, &mut omega, err, true, kp, ki, omega_lim);
+                        pll_correct(&mut theta, &mut omega, err, true);
+                    }
+
+                    // Decision-directed per-symbol phase alignment for soft-demapping (LLRs).
+                    let den = z_dd.norm();
+                    if den > 1e-6 {
+                        let rot = z_dd.conj() / den;
+                        for v in r_data_all.last_mut().unwrap().iter_mut() {
+                            *v *= rot;
+                        }
                     }
 
                     dll_do_update = true;
@@ -359,6 +401,32 @@ impl ScBltcModem {
                     dll_m = best_i;
                 }
                 q_data += 1;
+            }
+
+            // If the bank repeatedly prefers the same non-zero Δf, correct ω for the next symbol.
+            let snap_conf_min = 0.15f32;
+            if freq_conf.is_finite() && freq_conf >= snap_conf_min {
+                let df = best_dhz;
+                if let Some(cand) = snap_cand_hz {
+                    if (df - cand).abs() <= 0.5 * bank_step_hz {
+                        snap_count += 1;
+                    } else {
+                        snap_cand_hz = Some(df);
+                        snap_count = 1;
+                    }
+                } else {
+                    snap_cand_hz = Some(df);
+                    snap_count = 1;
+                }
+                if snap_count >= freq_snap_confirm {
+                    let df2 = snap_cand_hz.unwrap_or(0.0);
+                    if df2.abs() >= freq_snap_min_abs_hz {
+                        omega = (omega + 2.0 * std::f64::consts::PI * df2 * tsym)
+                            .clamp(-omega_lim, omega_lim);
+                    }
+                    snap_cand_hz = None;
+                    snap_count = 0;
+                }
             }
 
             let mut phase_adj = 0.0f64;
@@ -374,7 +442,7 @@ impl ScBltcModem {
                     let u_e_i = demask_symbol(&y_e, ell);
                     let u_l_i = demask_symbol(&y_l, ell);
                     for j in 0..p.sf {
-                        let rotj = rot_chips[j];
+                        let rotj = rot_best[j];
                         u_e[j] += w_mrc[i] * (u_e_i[j] * rotj);
                         u_l[j] += w_mrc[i] * (u_l_i[j] * rotj);
                     }

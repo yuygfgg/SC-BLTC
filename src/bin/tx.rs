@@ -613,12 +613,17 @@ fn main() -> anyhow::Result<()> {
     };
 
     let doppler = if args.doppler_std_hz > 0.0 {
-        Some(DopplerOu::new(
+        let mut d = DopplerOu::new(
             args.doppler_std_hz,
             args.doppler_tau_s,
             fs_actual_hz,
             args.doppler_max_hz,
-        ))
+        );
+        d.f_hz = args.doppler_std_hz * (gauss.next(&mut rng) as f64);
+        if d.max_abs_hz > 0.0 {
+            d.f_hz = d.f_hz.clamp(-d.max_abs_hz, d.max_abs_hz);
+        }
+        Some(d)
     } else {
         None
     };

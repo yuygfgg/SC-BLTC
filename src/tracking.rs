@@ -82,7 +82,6 @@ mod tests {
 
     #[test]
     fn loop_design_is_stable_for_low_symbol_rate_example() {
-        // Matches the symbol-rate regime in SC-BLTC: Tsym ~= 0.205s, BW=1Hz.
         let g = design_2nd_order_loop(1.0, 0.707, 0.205);
         assert!(g.kp.is_finite() && g.ki.is_finite());
         let (r1, r2) = loop_roots(g.kp, g.ki);
