@@ -14,7 +14,7 @@ fn end_to_end_ideal_frame() -> anyhow::Result<()> {
     let mut rx = frame.samples.clone();
     rx.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 16));
 
-    let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, 0, &[0], 0.0, 80)?;
+    let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, 0, &[0], 0.0, 8)?;
     assert!(meta.crc_ok, "meta={meta:?}");
     assert_eq!(pl.unwrap(), b"hello");
     Ok(())
@@ -40,7 +40,7 @@ fn end_to_end_with_known_cfo() -> anyhow::Result<()> {
         .collect();
     rx.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 16));
 
-    let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, 0, &[0], cfo_hz, 100)?;
+    let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, 0, &[0], cfo_hz, 8)?;
     assert!(meta.crc_ok, "meta={meta:?}");
     assert_eq!(pl.unwrap(), b"cfo");
     Ok(())
@@ -93,7 +93,7 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
         base,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
-        80,
+        16,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
     assert_eq!(pl.unwrap(), b"acq");
@@ -147,7 +147,7 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
         base,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
-        80,
+        16,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
     assert_eq!(pl.unwrap(), b"acq2");
@@ -238,7 +238,7 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
         base,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
-        120,
+        32,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
     assert_eq!(pl.unwrap(), payload);
@@ -324,7 +324,7 @@ fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
         base,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
-        120,
+        32,
     )?;
     assert!(meta.crc_ok, "meta={meta:?}, acq={acq:?}");
     assert_eq!(pl.unwrap(), payload);

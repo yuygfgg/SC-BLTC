@@ -2,7 +2,8 @@ use super::util::{apply_ramp_down, bits_to_symbols, is_pilot, pulse_shape_chips}
 use super::{ScBltcModem, TxFrame};
 use crate::crypto::gen_code_aes_ctr;
 use crate::frame::build_u_bits;
-use crate::ldpc::ldpc_encode_u256;
+use crate::interleaver::interleave_frame_bits;
+use crate::polar::polar_encode_u256;
 use crate::walsh::walsh_row;
 use num_complex::Complex32;
 
@@ -20,7 +21,8 @@ impl ScBltcModem {
         let u_bits_vec = build_u_bits(payload, ver, typ)?;
         let mut u_bits = [0u8; 256];
         u_bits.copy_from_slice(&u_bits_vec);
-        let b_bits = ldpc_encode_u256(&u_bits);
+        let b_bits = polar_encode_u256(&u_bits);
+        let b_bits = interleave_frame_bits(&b_bits);
         let m = bits_to_symbols(&b_bits, p.k_bits_per_sym);
         assert_eq!(m.len(), p.n_data);
 

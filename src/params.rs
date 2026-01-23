@@ -13,8 +13,8 @@ pub struct Params {
     pub n_pilot: usize,
     pub n_sym: usize,
 
-    pub ldpc_n: usize,
-    pub ldpc_k: usize,
+    pub fec_n: usize,
+    pub fec_k: usize,
 
     pub iv_res_s: f64,
     pub domain_u32: u32,
@@ -43,8 +43,8 @@ impl Default for Params {
             n_data: 64,
             n_pilot: 16,
             n_sym: 82,
-            ldpc_n: 512,
-            ldpc_k: 256,
+            fec_n: 512,
+            fec_k: 256,
             iv_res_s: 0.001,
             domain_u32: 0x424C_5443,
             n_tail: 8,
@@ -53,7 +53,7 @@ impl Default for Params {
             tx_ramp_ms: 20.0,
             nfft_acq: 32768,
             cfo_search_hz: 8000.0,
-            gamma_hybrid_mult: 25.0,
+            gamma_hybrid_mult: 10.0,
             rake_search_half_s: 0.004,
         }
     }

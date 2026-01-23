@@ -2,7 +2,8 @@ use super::util::{derotate_cfo_in_place, is_pilot, wrap_pm_pi};
 use super::{DecodeMeta, ScBltcModem};
 use crate::crypto::gen_code_aes_ctr;
 use crate::frame::parse_u_bits;
-use crate::ldpc::ldpc_decode_to_u256_from_llr;
+use crate::interleaver::deinterleave_frame_llr;
+use crate::polar::polar_decode_to_u256_from_llr;
 use crate::tracking::{design_2nd_order_loop, EarlyLateDll};
 use crate::walsh::{fht1024_in_place, walsh_row};
 use num_complex::Complex32;
@@ -16,13 +17,20 @@ impl ScBltcModem {
         frame_start_sample: usize,
         n_offset_total: &[usize],
         cfo_hz: f64,
-        maxiter: usize,
+        scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
         let p = &self.p;
         let mut x = rx_samples.to_vec();
         derotate_cfo_in_place(&mut x, p.fs_hz, cfo_hz);
         let y = self.rrc.filter_same(&x);
-        self.demod_decode_matched(&y, ti_tx, frame_start_sample, n_offset_total, 0.0, maxiter)
+        self.demod_decode_matched(
+            &y,
+            ti_tx,
+            frame_start_sample,
+            n_offset_total,
+            0.0,
+            scl_list_size,
+        )
     }
 
     /// Spec §4.C–§4.D.
@@ -33,7 +41,7 @@ impl ScBltcModem {
         frame_start_sample: usize,
         n_offset_total: &[usize],
         cfo_hz: f64,
-        maxiter: usize,
+        scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
         let p = &self.p;
         if n_offset_total.is_empty() {
@@ -510,7 +518,8 @@ impl ScBltcModem {
             *v = v.clamp(-1e6, 1e6);
         }
 
-        let u_hat = ldpc_decode_to_u256_from_llr(&llr, maxiter);
+        let llr = deinterleave_frame_llr(&llr);
+        let u_hat = polar_decode_to_u256_from_llr(&llr, scl_list_size);
         let (hdr, payload, crc_ok) = parse_u_bits(&u_hat)?;
         let meta = DecodeMeta {
             crc_ok,

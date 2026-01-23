@@ -23,8 +23,9 @@ struct Args {
     )]
     key_hex: String,
 
-    #[arg(long, default_value_t = 500)]
-    ldpc_maxiter: usize,
+    /// CA-SCL list size for Polar decoding (higher = slower, usually better).
+    #[arg(long, default_value_t = 16)]
+    scl_list_size: usize,
 
     /// Blind acquisition time window W (seconds). Larger = slower.
     #[arg(long, default_value_t = 0.5)]
@@ -290,7 +291,7 @@ fn main() -> anyhow::Result<()> {
                             frame_start_sample,
                             &cand.offsets,
                             cand.cfo_hz,
-                            args.ldpc_maxiter,
+                            args.scl_list_size,
                         )
                         .unwrap_or_else(|_e| {
                             (None, sc_bltc::modem::DecodeMeta::error("demod_error"))

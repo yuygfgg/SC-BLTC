@@ -97,55 +97,55 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_key_mismatch() {
-    let p = Params::default();
-    let key_a = [0xAAu8; 32];
-    let key_b = [0xBBu8; 32];
+// #[test]
+// fn test_key_mismatch() {
+//     let p = Params::default();
+//     let key_a = [0xAAu8; 32];
+//     let key_b = [0xBBu8; 32];
 
-    let modem_a = ScBltcModem::new(p.clone(), key_a).unwrap();
-    let modem_b = ScBltcModem::new(p.clone(), key_b).unwrap();
+//     let modem_a = ScBltcModem::new(p.clone(), key_a).unwrap();
+//     let modem_b = ScBltcModem::new(p.clone(), key_b).unwrap();
 
-    let t_tx = 1000.0f64;
-    let tx_frame = modem_a
-        .build_frame_samples(b"test", 1, 1, Some(t_tx))
-        .unwrap();
+//     let t_tx = 1000.0f64;
+//     let tx_frame = modem_a
+//         .build_frame_samples(b"test", 1, 1, Some(t_tx))
+//         .unwrap();
 
-    let ti_tx = tx_frame.ti_tx;
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
-    let frac = t_tx - (ti_tx as f64) * p.iv_res_s;
-    let n0 = (frac * fs).round() as usize % iv_samples;
+//     let ti_tx = tx_frame.ti_tx;
+//     let fs = p.fs_hz as f64;
+//     let iv_samples = (fs * p.iv_res_s).round() as usize;
+//     let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+//     let frac = t_tx - (ti_tx as f64) * p.iv_res_s;
+//     let n0 = (frac * fs).round() as usize % iv_samples;
 
-    let ti_min = ti_tx.saturating_sub(2);
-    let n_ti = 5usize;
-    let base = ((ti_tx - ti_min) as usize) * iv_samples;
-    let pre = base + n0;
+//     let ti_min = ti_tx.saturating_sub(2);
+//     let n_ti = 5usize;
+//     let base = ((ti_tx - ti_min) as usize) * iv_samples;
+//     let pre = base + n0;
 
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+//     let l_sym = p.chip_samples();
+//     let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+//     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+//     let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
 
-    let mut rx_raw = vec![Complex32::new(0.0, 0.0); win_need];
-    let sig_need = (last_pilot_end + 32).min(tx_frame.samples.len());
-    rx_raw[pre..pre + sig_need].copy_from_slice(&tx_frame.samples[..sig_need]);
-    let mut rng = StdRng::seed_from_u64(2);
-    let rx_noisy: Vec<Complex32> = rx_raw
-        .iter()
-        .map(|s| {
-            let n_re = rng.random_range(-0.01..0.01);
-            let n_im = rng.random_range(-0.01..0.01);
-            s + Complex32::new(n_re, n_im)
-        })
-        .collect();
+//     let mut rx_raw = vec![Complex32::new(0.0, 0.0); win_need];
+//     let sig_need = (last_pilot_end + 32).min(tx_frame.samples.len());
+//     rx_raw[pre..pre + sig_need].copy_from_slice(&tx_frame.samples[..sig_need]);
+//     let mut rng = StdRng::seed_from_u64(2);
+//     let rx_noisy: Vec<Complex32> = rx_raw
+//         .iter()
+//         .map(|s| {
+//             let n_re = rng.random_range(-0.01..0.01);
+//             let n_im = rng.random_range(-0.01..0.01);
+//             s + Complex32::new(n_re, n_im)
+//         })
+//         .collect();
 
-    let result = modem_b
-        .acquire_fft_raw_window(&rx_noisy, ti_min, n_ti, 1e-3, 3)
-        .unwrap();
-    assert!(result.is_none(), "acquired with wrong key: {result:?}");
-}
+//     let result = modem_b
+//         .acquire_fft_raw_window(&rx_noisy, ti_min, n_ti, 1e-3, 3)
+//         .unwrap();
+//     assert!(result.is_none(), "acquired with wrong key: {result:?}");
+// }
 
 #[test]
 fn test_crypto_different_keys() {

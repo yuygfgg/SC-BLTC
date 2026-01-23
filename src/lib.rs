@@ -2,8 +2,9 @@
 
 pub mod crypto;
 pub mod frame;
-pub mod ldpc;
+pub mod interleaver;
 pub mod modem;
+pub mod polar;
 pub mod params;
 pub mod ring;
 pub mod rrc;
