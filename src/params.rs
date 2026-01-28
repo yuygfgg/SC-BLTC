@@ -1,4 +1,6 @@
-#[derive(Clone, Debug)]
+use anyhow::Context;
+
+#[derive(Clone, Debug, serde::Deserialize)]
 /// Spec §1.
 pub struct Params {
     pub fs_hz: u32,
@@ -60,6 +62,13 @@ impl Default for Params {
 }
 
 impl Params {
+    pub fn from_file(path: &str) -> anyhow::Result<Self> {
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("read params file {path}"))?;
+        let params: Params = toml::from_str(&content).context("parse params toml")?;
+        Ok(params)
+    }
+
     pub fn tc_s(&self) -> f64 {
         1.0 / (self.rc_chip_sps as f64)
     }

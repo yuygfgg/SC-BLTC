@@ -19,6 +19,8 @@ aes = "0.8"
 ctr = "0.9"
 cipher = "0.4"
 rand_distr = "0.5.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [dev-dependencies]
 rand = "0.9"

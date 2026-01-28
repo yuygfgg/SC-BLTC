@@ -1,5 +1,6 @@
 //! SC-BLTC Rust implementation.
 
+pub mod channel;
 pub mod crypto;
 pub mod frame;
 pub mod interleaver;
