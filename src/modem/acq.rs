@@ -5,6 +5,51 @@ use num_complex::Complex32;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 
+#[derive(Clone, Copy, Debug)]
+struct Cand {
+    ti: u64,
+    off: usize,
+    p_max: f32,
+    f_hat: f64,
+}
+
+fn cand_better(a: Cand, b: Cand) -> bool {
+    match a.p_max.partial_cmp(&b.p_max).unwrap_or(Ordering::Equal) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => (a.ti, a.off) < (b.ti, b.off),
+    }
+}
+
+fn push_topk(topk: &mut Vec<Cand>, cand: Cand, k_keep: usize) {
+    if topk.len() < k_keep {
+        topk.push(cand);
+        return;
+    }
+    let mut min_i = 0usize;
+    for i in 1..topk.len() {
+        if cand_better(topk[min_i], topk[i]) {
+            min_i = i;
+        }
+    }
+    if cand_better(cand, topk[min_i]) {
+        topk[min_i] = cand;
+    }
+}
+
+struct AcqContext {
+    iv_samples: usize,
+    rake_search_half_samples: usize,
+    l_sym: usize,
+    n_ref_pre: usize,
+    pilot_timing_win: isize,
+    fs: f64,
+    nfft: usize,
+    bin_max: isize,
+    scratch_len: usize,
+    ref_pre_conj_by_ti: Vec<Vec<Complex32>>,
+}
+
 impl ScBltcModem {
     fn estimate_noise_power_mu(&self, x: &[Complex32]) -> f64 {
         // median(|x|^2) = mu * ln(2)
@@ -45,7 +90,7 @@ impl ScBltcModem {
     fn energy_of_seq_with_cfo(&self, y: &[Complex32], fs_hz: u32, cfo_hz: f64) -> f64 {
         // Computes |sum_k y[k] * exp(-j 2π f k / fs)|^2.
         let fs = fs_hz as f32;
-        let dphi = (-2.0 * std::f32::consts::PI * (cfo_hz as f32) / fs) as f32;
+        let dphi = -2.0 * std::f32::consts::PI * (cfo_hz as f32) / fs;
         let w = Complex32::from_polar(1.0, dphi);
         let mut ph = Complex32::new(1.0, 0.0);
         let mut acc = Complex32::new(0.0, 0.0);
@@ -75,15 +120,13 @@ impl ScBltcModem {
         }
     }
 
-    fn acquire_fft_window_impl(
+    fn prepare_acq_context(
         &self,
         rx_window: &[Complex32],
         ti_min: u64,
         n_ti: usize,
-        n_finger: usize,
         matched: bool,
-    ) -> anyhow::Result<Option<AcqResult>> {
-        // Spec §4.B
+    ) -> anyhow::Result<AcqContext> {
         let p = &self.p;
         let iv_samples = ((p.fs_hz as f64) * p.iv_res_s).round() as usize;
         if iv_samples == 0 {
@@ -127,41 +170,7 @@ impl ScBltcModem {
         let bin_max = ((search_hz * (nfft as f64)) / fs).floor() as isize;
         let bin_max = bin_max.clamp(1, (nfft as isize) / 2 - 1);
 
-        let fft = &self.fft_acq;
-        debug_assert_eq!(fft.len(), nfft);
         let scratch_len = self.fft_acq_scratch_len;
-
-        #[derive(Clone, Copy, Debug)]
-        struct Cand {
-            ti: u64,
-            off: usize,
-            p_max: f32,
-            f_hat: f64,
-        }
-
-        fn cand_better(a: Cand, b: Cand) -> bool {
-            match a.p_max.partial_cmp(&b.p_max).unwrap_or(Ordering::Equal) {
-                Ordering::Greater => true,
-                Ordering::Less => false,
-                Ordering::Equal => (a.ti, a.off) < (b.ti, b.off),
-            }
-        }
-
-        fn push_topk(topk: &mut Vec<Cand>, cand: Cand, k_keep: usize) {
-            if topk.len() < k_keep {
-                topk.push(cand);
-                return;
-            }
-            let mut min_i = 0usize;
-            for i in 1..topk.len() {
-                if cand_better(topk[min_i], topk[i]) {
-                    min_i = i;
-                }
-            }
-            if cand_better(cand, topk[min_i]) {
-                topk[min_i] = cand;
-            }
-        }
 
         let ref_pre_conj_by_ti: Vec<Vec<Complex32>> = (0..n_ti)
             .map(|ti_idx| {
@@ -176,57 +185,80 @@ impl ScBltcModem {
             })
             .collect();
 
+        Ok(AcqContext {
+            iv_samples,
+            rake_search_half_samples,
+            l_sym,
+            n_ref_pre,
+            pilot_timing_win,
+            fs,
+            nfft,
+            bin_max,
+            scratch_len,
+            ref_pre_conj_by_ti,
+        })
+    }
+
+    fn find_coarse_candidates(
+        &self,
+        rx_window: &[Complex32],
+        ti_min: u64,
+        n_ti: usize,
+        ctx: &AcqContext,
+    ) -> Vec<Cand> {
+        let fft = &self.fft_acq;
+        debug_assert_eq!(fft.len(), ctx.nfft);
+
         let k_keep: usize = 50;
-        let bin_max_u = bin_max as usize;
+        let bin_max_u = ctx.bin_max as usize;
         let idx_of = |b: isize| -> usize {
             if b >= 0 {
                 b as usize
             } else {
-                nfft - ((-b) as usize)
+                ctx.nfft - ((-b) as usize)
             }
         };
 
         let off_chunk: usize = 4;
-        let topk: Vec<Cand> = (0..n_ti)
+        (0..n_ti)
             .into_par_iter()
             .flat_map_iter(|ti_idx| {
-                (0..iv_samples)
+                (0..ctx.iv_samples)
                     .step_by(off_chunk)
-                    .map(move |off0| (ti_idx, off0, (off0 + off_chunk).min(iv_samples)))
+                    .map(move |off0| (ti_idx, off0, (off0 + off_chunk).min(ctx.iv_samples)))
             })
             .map_init(
                 || {
                     (
-                        vec![Complex32::new(0.0, 0.0); nfft],
-                        vec![Complex32::new(0.0, 0.0); scratch_len],
+                        vec![Complex32::new(0.0, 0.0); ctx.nfft],
+                        vec![Complex32::new(0.0, 0.0); ctx.scratch_len],
                     )
                 },
                 |state, (ti_idx, off0, off1)| {
                     let buf = &mut state.0;
                     let scratch = &mut state.1;
                     let ti = ti_min + (ti_idx as u64);
-                    let base = ti_idx * iv_samples;
-                    let refc = &ref_pre_conj_by_ti[ti_idx];
+                    let base = ti_idx * ctx.iv_samples;
+                    let refc = &ctx.ref_pre_conj_by_ti[ti_idx];
                     let mut local_topk: Vec<Cand> = Vec::with_capacity(k_keep);
 
                     for off in off0..off1 {
                         let y0 = base + off;
-                        let rx_slice = &rx_window[y0..y0 + n_ref_pre];
-                        for (dst, (r, c)) in buf[..n_ref_pre]
+                        let rx_slice = &rx_window[y0..y0 + ctx.n_ref_pre];
+                        for (dst, (r, c)) in buf[..ctx.n_ref_pre]
                             .iter_mut()
                             .zip(rx_slice.iter().zip(refc.iter()))
                         {
                             *dst = *r * *c;
                         }
-                        buf[n_ref_pre..].fill(Complex32::new(0.0, 0.0));
+                        buf[ctx.n_ref_pre..].fill(Complex32::new(0.0, 0.0));
 
                         fft.process_with_scratch(&mut buf[..], &mut scratch[..]);
 
                         let mut p_max = f32::NEG_INFINITY;
                         let mut best_bin: isize = 0;
 
-                        for b in 0..=bin_max_u {
-                            let v = buf[b];
+                        for (b, v) in buf.iter().enumerate().take(bin_max_u + 1) {
                             let pw = v.re * v.re + v.im * v.im;
                             if pw > p_max {
                                 p_max = pw;
@@ -234,7 +266,7 @@ impl ScBltcModem {
                             }
                         }
                         for b in 1..=bin_max_u {
-                            let v = buf[nfft - b];
+                            let v = buf[ctx.nfft - b];
                             let pw = v.re * v.re + v.im * v.im;
                             if pw > p_max {
                                 p_max = pw;
@@ -243,7 +275,7 @@ impl ScBltcModem {
                         }
 
                         let mut bin_f = best_bin as f64;
-                        if best_bin > -bin_max && best_bin < bin_max {
+                        if best_bin > -ctx.bin_max && best_bin < ctx.bin_max {
                             let idx_m1 = idx_of(best_bin - 1);
                             let idx_p1 = idx_of(best_bin + 1);
                             let v_m1 = buf[idx_m1];
@@ -257,7 +289,7 @@ impl ScBltcModem {
                                 bin_f += delta.clamp(-0.5, 0.5);
                             }
                         }
-                        let f_hat = bin_f * fs / (nfft as f64);
+                        let f_hat = bin_f * ctx.fs / (ctx.nfft as f64);
 
                         push_topk(
                             &mut local_topk,
@@ -281,8 +313,19 @@ impl ScBltcModem {
                     }
                     a
                 },
-            );
+            )
+    }
 
+    fn refine_and_verify_candidates(
+        &self,
+        rx_window: &[Complex32],
+        ti_min: u64,
+        n_ti: usize,
+        matched: bool,
+        ctx: &AcqContext,
+        topk: &[Cand],
+    ) -> anyhow::Result<Option<(Cand, f64, f64)>> {
+        let p = &self.p;
         if topk.is_empty() {
             return Ok(None);
         }
@@ -292,7 +335,7 @@ impl ScBltcModem {
             return Ok(None);
         }
 
-        let e_pre: f64 = ref_pre_conj_by_ti[0]
+        let e_pre: f64 = ctx.ref_pre_conj_by_ti[0]
             .iter()
             .map(|v| v.norm_sqr() as f64)
             .sum();
@@ -325,15 +368,16 @@ impl ScBltcModem {
         let fine_step_hz: f64 = 0.25;
         let fine_steps: i64 = (fine_span_hz / fine_step_hz).round() as i64;
 
-        let delta_pos_by_pilot: Vec<usize> = (0..p.n_pilot).map(|r| (2 + 5 * r) * l_sym).collect();
+        let delta_pos_by_pilot: Vec<usize> =
+            (0..p.n_pilot).map(|r| (2 + 5 * r) * ctx.l_sym).collect();
 
         let best_final: Option<(Cand, f64, f64)> = topk
             .par_iter()
             .map_init(
                 || {
                     (
-                        vec![Complex32::new(0.0, 0.0); n_ref_pre],
-                        vec![Complex32::new(0.0, 0.0); l_sym],
+                        vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre],
+                        vec![Complex32::new(0.0, 0.0); ctx.l_sym],
                     )
                 },
                 |state, &cand| {
@@ -341,16 +385,16 @@ impl ScBltcModem {
                     let ref_rot = &mut state.1;
 
                     let ti_idx = (cand.ti - ti_min) as usize;
-                    let base = ti_idx * iv_samples;
+                    let base = ti_idx * ctx.iv_samples;
                     let y0 = base + cand.off;
 
-                    let ref_pre_conj = &ref_pre_conj_by_ti[ti_idx];
+                    let ref_pre_conj = &ctx.ref_pre_conj_by_ti[ti_idx];
                     let pilots = pilot_ref_conj_by_ti[ti_idx]
                         .as_ref()
                         .expect("missing pilot refs for candidate TI");
 
                     for (dst, (r, c)) in y_pre.iter_mut().zip(
-                        rx_window[y0..y0 + n_ref_pre]
+                        rx_window[y0..y0 + ctx.n_ref_pre]
                             .iter()
                             .zip(ref_pre_conj.iter()),
                     ) {
@@ -369,13 +413,13 @@ impl ScBltcModem {
                     }
 
                     let fs_f32 = p.fs_hz as f32;
-                    let dphi = (-2.0 * std::f32::consts::PI * (f_best as f32) / fs_f32) as f32;
+                    let dphi = -2.0 * std::f32::consts::PI * (f_best as f32) / fs_f32;
                     let w = Complex32::from_polar(1.0, dphi);
 
                     let mut vpil: f64 = 0.0;
                     for r in 0..p.n_pilot {
                         let refc = &pilots[r];
-                        debug_assert_eq!(refc.len(), l_sym);
+                        debug_assert_eq!(refc.len(), ctx.l_sym);
                         let delta_pos = delta_pos_by_pilot[r];
 
                         let mut ph = Complex32::new(1.0, 0.0);
@@ -385,7 +429,7 @@ impl ScBltcModem {
                         }
 
                         let mut best_e = 0.0f64;
-                        for d in -pilot_timing_win..=pilot_timing_win {
+                        for d in -ctx.pilot_timing_win..=ctx.pilot_timing_win {
                             let start = (y0 as isize) + (delta_pos as isize) + d;
                             if start < 0 {
                                 continue;
@@ -422,17 +466,26 @@ impl ScBltcModem {
                 },
             );
 
-        let Some((best, lambda_best, f_fine)) = best_final else {
-            return Ok(None);
-        };
+        Ok(best_final)
+    }
 
+    fn find_rake_fingers(
+        &self,
+        rx_window: &[Complex32],
+        ti_min: u64,
+        n_finger: usize,
+        ctx: &AcqContext,
+        best: Cand,
+        f_fine: f64,
+    ) -> anyhow::Result<AcqResult> {
+        let p = &self.p;
         let best_ti_idx = (best.ti - ti_min) as usize;
-        let base = best_ti_idx * iv_samples;
-        let ref_pre_conj = &ref_pre_conj_by_ti[best_ti_idx];
-        let mut ref_pre_rot = vec![Complex32::new(0.0, 0.0); n_ref_pre];
+        let base = best_ti_idx * ctx.iv_samples;
+        let ref_pre_conj = &ctx.ref_pre_conj_by_ti[best_ti_idx];
+        let mut ref_pre_rot = vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre];
         {
             let fs_f32 = p.fs_hz as f32;
-            let dphi = (-2.0 * std::f32::consts::PI * (f_fine as f32) / fs_f32) as f32;
+            let dphi = -2.0 * std::f32::consts::PI * (f_fine as f32) / fs_f32;
             let w = Complex32::from_polar(1.0, dphi);
             let mut ph = Complex32::new(1.0, 0.0);
             for (dst, c) in ref_pre_rot.iter_mut().zip(ref_pre_conj.iter()) {
@@ -446,13 +499,13 @@ impl ScBltcModem {
         // offsets from the start of the acquired IV epoch (the `ti_hat` boundary). The nominal
         // "symmetric" +/- search window is therefore clipped to `[0, max_off]` at the low end.
         let center = best.off as isize;
-        let half = rake_search_half_samples as isize;
+        let half = ctx.rake_search_half_samples as isize;
         let mut off_lo: isize = center - half;
         if off_lo < 0 {
             off_lo = 0;
         }
         let mut off_hi: isize = center + half;
-        let max_start = rx_window.len().saturating_sub(n_ref_pre);
+        let max_start = rx_window.len().saturating_sub(ctx.n_ref_pre);
         let max_off = max_start.saturating_sub(base) as isize;
         if off_hi > max_off {
             off_hi = max_off;
@@ -498,13 +551,34 @@ impl ScBltcModem {
         finger_offsets.sort_unstable();
         finger_offsets.dedup();
 
-        Ok(Some(AcqResult {
+        Ok(AcqResult {
             ti_hat: best.ti,
             n0,
             cfo_hat_hz: f_fine,
             finger_offsets,
-            p_max: lambda_best as f32,
-        }))
+            p_max: best.p_max,
+        })
+    }
+
+    fn acquire_fft_window_impl(
+        &self,
+        rx_window: &[Complex32],
+        ti_min: u64,
+        n_ti: usize,
+        n_finger: usize,
+        matched: bool,
+    ) -> anyhow::Result<Option<AcqResult>> {
+        // Spec §4.B
+        let ctx = self.prepare_acq_context(rx_window, ti_min, n_ti, matched)?;
+        let topk = self.find_coarse_candidates(rx_window, ti_min, n_ti, &ctx);
+        let Some((best, lambda_best, f_fine)) =
+            self.refine_and_verify_candidates(rx_window, ti_min, n_ti, matched, &ctx, &topk)?
+        else {
+            return Ok(None);
+        };
+        let mut out = self.find_rake_fingers(rx_window, ti_min, n_finger, &ctx, best, f_fine)?;
+        out.p_max = lambda_best as f32;
+        Ok(Some(out))
     }
 
     pub fn acquire_fft_raw_window(

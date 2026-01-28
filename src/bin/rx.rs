@@ -3,6 +3,7 @@ use clap::Parser;
 use num_complex::Complex32;
 use sc_bltc::modem::ScBltcModem;
 use sc_bltc::params::Params;
+use sc_bltc::ring::Ring;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
@@ -78,457 +79,487 @@ fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-fn accept_one(bind: &str, read_timeout_ms: u64) -> anyhow::Result<TcpStream> {
-    let listener = TcpListener::bind(bind).with_context(|| format!("bind {}", bind))?;
-    eprintln!("[rx_tcp] listening on {bind}");
-    let (stream, peer) = listener.accept().context("accept")?;
-    if read_timeout_ms > 0 {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(read_timeout_ms)))
-            .context("set_read_timeout")?;
-    }
-    stream.set_nodelay(true).ok();
-    eprintln!("[rx_tcp] connection from {peer}");
-    Ok(stream)
-}
-
 #[derive(Clone, Debug)]
-struct Ring<T: Copy> {
-    buf: Vec<T>,
-    cap: u64,
-    abs_base: u64,
-    abs_next: u64,
+struct Pending {
+    ti: u64,
+    base_abs: u64,
+    offsets: Vec<usize>,
+    cfo_hz: f64,
+    p_max: f32,
+    need_abs: u64,
 }
 
-impl<T: Copy + Default> Ring<T> {
-    fn new(cap: usize) -> Self {
-        Self {
-            buf: vec![T::default(); cap.max(1)],
-            cap: cap.max(1) as u64,
-            abs_base: 0,
-            abs_next: 0,
-        }
-    }
-
-    fn len(&self) -> u64 {
-        self.abs_next - self.abs_base
-    }
-
-    fn push_slice(&mut self, xs: &[T]) {
-        for &x in xs {
-            let idx = (self.abs_next % self.cap) as usize;
-            self.buf[idx] = x;
-            self.abs_next += 1;
-            if self.abs_next - self.abs_base > self.cap {
-                self.abs_base = self.abs_next - self.cap;
-            }
-        }
-    }
-
-    fn get_vec(&self, start_abs: u64, len: usize) -> Option<Vec<T>> {
-        let len_u = len as u64;
-        if start_abs < self.abs_base {
-            return None;
-        }
-        if start_abs + len_u > self.abs_next {
-            return None;
-        }
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len_u {
-            let idx = ((start_abs + i) % self.cap) as usize;
-            out.push(self.buf[idx]);
-        }
-        Some(out)
-    }
+struct DebugStats {
+    last_dbg: Instant,
+    samp: u64,
+    pwr_sum: f64,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let p = Params::default();
-    let key = parse_key_hex(&args.key_hex)?;
-    let modem = ScBltcModem::new(p.clone(), key)?;
+struct Receiver {
+    args: Args,
+    p: Params,
+    modem: ScBltcModem,
+    ring: Ring<Complex32>,
+    pending: HashMap<u64, Pending>,
+    max_pending: usize,
+    stash: Vec<u8>,
+    buf: Vec<u8>,
+    last_acq: Instant,
+    last_decoded_ti: Option<u64>,
+    search_cursor_ti: Option<u64>,
+    t0_s: Option<f64>,
+    fs: f64,
+    iv_samples: u64,
+    acq_guard_samples: u64,
+    acq_tail_samples: u64,
+    dbg: DebugStats,
+}
 
-    let mut stream = accept_one(&args.bind, args.read_timeout_ms)?;
+impl Receiver {
+    fn new(args: Args) -> anyhow::Result<Self> {
+        let p = Params::default();
+        let key = parse_key_hex(&args.key_hex)?;
+        let modem = ScBltcModem::new(p.clone(), key)?;
 
-    let mut magic = [0u8; 8];
-    stream.read_exact(&mut magic).context("read magic")?;
-    if &magic != MAGIC {
-        anyhow::bail!("bad magic: expected {:?}, got {:?}", MAGIC, magic);
+        let fs = p.fs_hz as f64;
+        let iv_samples = ((p.fs_hz as f64) * p.iv_res_s).round() as u64;
+        let l_sym = p.chip_samples() as u64;
+        let ell_last_pilot = 2u64 + 5u64 * (p.n_pilot.saturating_sub(1) as u64);
+        let last_pilot_end = (ell_last_pilot + 1) * l_sym;
+        let pilot_timing_win: u64 = 32;
+        let rake_search_half_samples: u64 =
+            ((p.fs_hz as f64) * p.rake_search_half_s).round().max(0.0) as u64;
+        let acq_guard_samples =
+            last_pilot_end + pilot_timing_win + iv_samples + rake_search_half_samples;
+        let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
+
+        let cap_samples = (args.buffer_sec.max(1.0) * fs).round() as usize;
+        let ring = Ring::<Complex32>::new(cap_samples);
+
+        Ok(Self {
+            args,
+            p,
+            modem,
+            ring,
+            pending: HashMap::new(),
+            max_pending: 8,
+            stash: Vec::new(),
+            buf: vec![0u8; 32 * 1024],
+            last_acq: Instant::now() - Duration::from_secs(3600),
+            last_decoded_ti: None,
+            search_cursor_ti: None,
+            t0_s: None,
+            fs,
+            iv_samples,
+            acq_guard_samples,
+            acq_tail_samples,
+            dbg: DebugStats {
+                last_dbg: Instant::now() - Duration::from_secs(3600),
+                samp: 0,
+                pwr_sum: 0.0,
+            },
+        })
     }
-    let fs_hz = read_u32_le(&mut stream).context("read fs_hz")?;
-    let t0_ns = read_u64_le(&mut stream).context("read t0_ns")?;
-    if fs_hz != p.fs_hz {
-        anyhow::bail!(
-            "fs mismatch: sender fs_hz={} but Params.fs_hz={}",
-            fs_hz,
-            p.fs_hz
-        );
+
+    fn accept_connection(&self) -> anyhow::Result<TcpStream> {
+        let listener = TcpListener::bind(&self.args.bind)
+            .with_context(|| format!("bind {}", self.args.bind))?;
+        eprintln!("[rx_tcp] listening on {}", self.args.bind);
+        let (stream, peer) = listener.accept().context("accept")?;
+        if self.args.read_timeout_ms > 0 {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(self.args.read_timeout_ms)))
+                .context("set_read_timeout")?;
+        }
+        stream.set_nodelay(true).ok();
+        eprintln!("[rx_tcp] connection from {peer}");
+        Ok(stream)
     }
-    eprintln!("[rx_tcp] handshake ok (fs={}Hz, t0_ns={})", fs_hz, t0_ns);
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = ((p.fs_hz as f64) * p.iv_res_s).round() as u64;
-    let l_sym = p.chip_samples() as u64;
-    // Spec §4.B
-    let ell_last_pilot = 2u64 + 5u64 * (p.n_pilot.saturating_sub(1) as u64);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let pilot_timing_win: u64 = 32;
-    let rake_search_half_samples: u64 =
-        ((p.fs_hz as f64) * p.rake_search_half_s).round().max(0.0) as u64;
-    // Spec §4.B.1
-    // Spec §4.B.3
-    let acq_guard_samples =
-        last_pilot_end + pilot_timing_win + iv_samples + rake_search_half_samples;
-    let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
-
-    let cap_samples = (args.buffer_sec.max(1.0) * fs).round() as usize;
-    let mut ring = Ring::<Complex32>::new(cap_samples);
-
-    let t0_s: Option<f64> = Some((t0_ns as f64) * 1e-9);
-    let mut last_acq = Instant::now() - Duration::from_secs(3600);
-    let mut last_decoded_ti: Option<u64> = None;
-    let mut search_cursor_ti: Option<u64> = None;
-
-    #[derive(Clone, Debug)]
-    struct Pending {
-        ti: u64,
-        base_abs: u64,
-        offsets: Vec<usize>,
-        cfo_hz: f64,
-        p_max: f32,
-        need_abs: u64,
+    fn handshake(&mut self, stream: &mut TcpStream) -> anyhow::Result<()> {
+        let mut magic = [0u8; 8];
+        stream.read_exact(&mut magic).context("read magic")?;
+        if &magic != MAGIC {
+            anyhow::bail!("bad magic: expected {:?}, got {:?}", MAGIC, magic);
+        }
+        let fs_hz = read_u32_le(stream).context("read fs_hz")?;
+        let t0_ns = read_u64_le(stream).context("read t0_ns")?;
+        if fs_hz != self.p.fs_hz {
+            anyhow::bail!(
+                "fs mismatch: sender fs_hz={} but Params.fs_hz={}",
+                fs_hz,
+                self.p.fs_hz
+            );
+        }
+        eprintln!("[rx_tcp] handshake ok (fs={}Hz, t0_ns={})", fs_hz, t0_ns);
+        self.t0_s = Some((t0_ns as f64) * 1e-9);
+        Ok(())
     }
-    // Spec §4.B.3.
-    let mut pending: HashMap<u64, Pending> = HashMap::new();
-    let max_pending: usize = 8;
 
-    let mut stash: Vec<u8> = Vec::new();
-    let mut buf = vec![0u8; 32 * 1024];
-
-    let mut last_dbg = Instant::now() - Duration::from_secs(3600);
-    let mut dbg_samp: u64 = 0;
-    let mut dbg_pwr_sum: f64 = 0.0;
-
-    loop {
-        let n = match stream.read(&mut buf) {
-            Ok(0) => break,
+    fn read_samples(&mut self, stream: &mut TcpStream) -> anyhow::Result<Option<Vec<Complex32>>> {
+        let n = match stream.read(&mut self.buf) {
+            Ok(0) => return Ok(None),
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e).context("read tcp stream").map_err(Into::into),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Some(Vec::new())),
+            Err(e) => return Err(e).context("read tcp stream"),
         };
-        stash.extend_from_slice(&buf[..n]);
+        self.stash.extend_from_slice(&self.buf[..n]);
 
-        let n_samp = stash.len() / 8;
+        let n_samp = self.stash.len() / 8;
         if n_samp == 0 {
-            continue;
+            return Ok(Some(Vec::new()));
         }
         let used = n_samp * 8;
         let mut raw: Vec<Complex32> = Vec::with_capacity(n_samp);
         for i in 0..n_samp {
             let off = i * 8;
-            let re = f32::from_le_bytes(stash[off..off + 4].try_into().unwrap());
-            let im = f32::from_le_bytes(stash[off + 4..off + 8].try_into().unwrap());
+            let re = f32::from_le_bytes(self.stash[off..off + 4].try_into().unwrap());
+            let im = f32::from_le_bytes(self.stash[off + 4..off + 8].try_into().unwrap());
             raw.push(Complex32::new(re, im));
         }
-        stash.drain(..used);
+        self.stash.drain(..used);
+        Ok(Some(raw))
+    }
 
-        ring.push_slice(&raw);
+    fn push_samples(&mut self, raw: &[Complex32]) {
+        self.ring.push_slice(raw);
         if !raw.is_empty() {
-            dbg_samp = dbg_samp.saturating_add(raw.len() as u64);
+            self.dbg.samp = self.dbg.samp.saturating_add(raw.len() as u64);
             let pwr: f64 = raw
                 .iter()
                 .map(|v| (v.re as f64) * (v.re as f64) + (v.im as f64) * (v.im as f64))
                 .sum();
-            dbg_pwr_sum += pwr;
-        }
-
-        if args.debug && last_dbg.elapsed() >= Duration::from_millis(1000) {
-            last_dbg = Instant::now();
-            let pwr_avg = if dbg_samp > 0 {
-                dbg_pwr_sum / (dbg_samp as f64)
-            } else {
-                0.0
-            };
-            eprintln!(
-                "[rx_tcp][dbg] ring: len={} (base={}, next={}), raw_avg_power={:.3e}, stash_rem_bytes={}, acq_ready={} (acq_tail_samples={})",
-                ring.len(),
-                ring.abs_base,
-                ring.abs_next,
-                pwr_avg,
-                stash.len(),
-                ring.len() >= acq_tail_samples,
-                acq_tail_samples
-            );
-            dbg_samp = 0;
-            dbg_pwr_sum = 0.0;
-        }
-
-        if !pending.is_empty() {
-            let mut best_ready: Option<Pending> = None;
-            for cand in pending.values() {
-                if ring.abs_next < cand.need_abs {
-                    continue;
-                }
-                let better = best_ready
-                    .as_ref()
-                    .map(|b| cand.p_max > b.p_max)
-                    .unwrap_or(true);
-                if better {
-                    best_ready = Some(cand.clone());
-                }
-            }
-
-            if let Some(cand) = best_ready {
-                let hist = modem.rrc.taps.len().saturating_sub(1) as u64;
-                let start_abs = cand.base_abs.saturating_sub(hist);
-                let len = (cand.need_abs - start_abs) as usize;
-                if let Some(y) = ring.get_vec(start_abs, len) {
-                    let frame_start_sample = (cand.base_abs - start_abs) as usize;
-                    let (payload, meta) = modem
-                        .demod_decode_raw(
-                            &y,
-                            cand.ti,
-                            frame_start_sample,
-                            &cand.offsets,
-                            cand.cfo_hz,
-                            args.scl_list_size,
-                        )
-                        .unwrap_or_else(|_e| {
-                            (None, sc_bltc::modem::DecodeMeta::error("demod_error"))
-                        });
-
-                    if let Some(pl) = payload {
-                        let s = String::from_utf8_lossy(&pl);
-                        println!(
-                            "[rx_tcp] decoded: {} (crc_ok={}, ver={}, type={}, len={}, ti_tx={}, p_max={:.3e}, cfo={:.2}Hz, offsets={:?})",
-                            s,
-                            meta.crc_ok,
-                            meta.ver,
-                            meta.typ,
-                            meta.len,
-                            cand.ti,
-                            cand.p_max,
-                            cand.cfo_hz,
-                            cand.offsets
-                        );
-                        last_decoded_ti = Some(cand.ti);
-                    } else {
-                        eprintln!(
-                            "[rx_tcp] decode failed (crc_ok={}, err={:?}, ver={}, type={}, len={}, ti_tx={}, p_max={:.3e}, cfo={:.2}Hz, offsets={:?})",
-                            meta.crc_ok,
-                            meta.err,
-                            meta.ver,
-                            meta.typ,
-                            meta.len,
-                            cand.ti,
-                            cand.p_max,
-                            cand.cfo_hz,
-                            cand.offsets
-                        );
-                    }
-                }
-
-                pending.remove(&cand.ti);
-            }
-        }
-
-        if last_acq.elapsed() >= Duration::from_millis(args.acq_interval_ms)
-            && ring.len() > acq_tail_samples
-        {
-            last_acq = Instant::now();
-            let Some(t0) = t0_s else { continue };
-
-            let t_latest = t0 + ((ring.abs_next.saturating_sub(acq_tail_samples)) as f64) / fs;
-            let ti_latest_i = (t_latest / p.iv_res_s).floor() as i64;
-            let ti_earliest_i = ((t0 + (ring.abs_base as f64) / fs) / p.iv_res_s).ceil() as i64;
-
-            let ti_latest = ti_latest_i.max(0) as u64;
-            let mut ti_earliest = ti_earliest_i.max(0) as u64;
-            if ti_latest < ti_earliest {
-                search_cursor_ti = Some(ti_earliest);
-                continue;
-            }
-
-            let w_ti = ((args.w_sec / p.iv_res_s).ceil().max(1.0)) as u64;
-            let ti_floor = ti_latest.saturating_sub(w_ti);
-            ti_earliest = ti_earliest.max(ti_floor);
-
-            if search_cursor_ti.is_none() {
-                search_cursor_ti = Some(ti_earliest);
-            }
-            let mut next_ti = search_cursor_ti.unwrap();
-
-            if next_ti < ti_earliest {
-                if args.debug {
-                    eprintln!(
-                        "[rx_tcp][dbg] ring overrun: skipped TI {}..{}",
-                        next_ti, ti_earliest
-                    );
-                }
-                next_ti = ti_earliest;
-            }
-
-            if next_ti > ti_latest {
-                search_cursor_ti = Some(next_ti);
-                continue;
-            }
-
-            let max_batch = 5000u64;
-            let mut ti_end = next_ti + max_batch;
-            if ti_end > ti_latest {
-                ti_end = ti_latest;
-            }
-
-            let n_start_f = ((next_ti as f64) * p.iv_res_s - t0) * fs;
-            let n_start = n_start_f.round().max(0.0) as u64;
-
-            if n_start < ring.abs_base {
-                let delta_samp = ring.abs_base - n_start;
-                let delta_ti = (delta_samp + iv_samples - 1) / iv_samples;
-                search_cursor_ti = Some(next_ti.saturating_add(delta_ti));
-                continue;
-            }
-
-            if n_start.saturating_add(acq_tail_samples) > ring.abs_next {
-                search_cursor_ti = Some(next_ti);
-                continue;
-            }
-
-            let max_n_ti_by_end = {
-                let slack = ring
-                    .abs_next
-                    .saturating_sub(n_start)
-                    .saturating_sub(acq_guard_samples);
-                (slack / iv_samples).max(1)
-            };
-            let mut n_ti = (ti_end - next_ti + 1) as u64;
-            if n_ti > max_n_ti_by_end {
-                n_ti = max_n_ti_by_end;
-                ti_end = next_ti + n_ti - 1;
-            }
-            let n_ti = n_ti as usize;
-
-            let win_len = (n_ti as u64)
-                .saturating_mul(iv_samples)
-                .saturating_add(acq_guard_samples) as usize;
-
-            let Some(y_win) = ring.get_vec(n_start, win_len) else {
-                if args.debug {
-                    eprintln!(
-                        "[rx_tcp][dbg] acq skipped: ring.get_vec failed (n_start={}, win_len={})",
-                        n_start, win_len
-                    );
-                }
-                search_cursor_ti = Some(next_ti + 1);
-                continue;
-            };
-
-            if args.debug {
-                eprintln!(
-                    "[rx_tcp][dbg] acq scan: ti={}..{} (n={}), n_start={}, win_len={}",
-                    next_ti, ti_end, n_ti, n_start, win_len
-                );
-            }
-
-            let backlog_before_s = (ti_latest.saturating_sub(next_ti) as f64) * p.iv_res_s;
-            let t_acq0 = Instant::now();
-            match modem.acquire_fft_raw_window(
-                &y_win,
-                next_ti,
-                n_ti,
-                args.p_fa_total,
-                args.n_finger,
-            ) {
-                Ok(Some(acq)) => {
-                    if last_decoded_ti != Some(acq.ti_hat) {
-                        let base_abs = n_start + ((acq.ti_hat - next_ti) as u64) * iv_samples;
-                        let max_off =
-                            acq.finger_offsets.iter().copied().max().unwrap_or(acq.n0) as u64;
-                        let decode_need_abs = base_abs
-                            + max_off
-                            + (p.frame_samples_with_tail() as u64)
-                            + (4 * modem.rrc.delay() as u64)
-                            + 256;
-                        let decode_in_s =
-                            (decode_need_abs.saturating_sub(ring.abs_next) as f64) / fs;
-
-                        let cand = Pending {
-                            ti: acq.ti_hat,
-                            base_abs,
-                            offsets: acq.finger_offsets,
-                            cfo_hz: acq.cfo_hat_hz,
-                            p_max: acq.p_max,
-                            need_abs: decode_need_abs,
-                        };
-                        let update = pending
-                            .get(&cand.ti)
-                            .map(|old| cand.p_max > old.p_max)
-                            .unwrap_or(true);
-                        if update {
-                            if args.debug {
-                                eprintln!(
-                                    "[rx_tcp][dbg] acq candidate: ti_hat={}, n0={}, p_max={:.3e}, cfo={:.2}Hz, fingers={:?}, base_abs={} (decode_in~{:.1}s)",
-                                    acq.ti_hat,
-                                    acq.n0,
-                                    acq.p_max,
-                                    acq.cfo_hat_hz,
-                                    cand.offsets,
-                                    base_abs,
-                                    decode_in_s
-                                );
-                            } else {
-                                eprintln!(
-                                    "[rx_tcp] acq: ti_hat={}, n0={}, p_max={:.3e}, cfo={:.2}Hz, fingers={:?}, base_abs={} (decode_in~{:.1}s)",
-                                    acq.ti_hat,
-                                    acq.n0,
-                                    acq.p_max,
-                                    acq.cfo_hat_hz,
-                                    cand.offsets,
-                                    base_abs,
-                                    decode_in_s
-                                );
-                            }
-                            pending.insert(cand.ti, cand);
-                        }
-
-                        if pending.len() > max_pending {
-                            if let Some((&worst_ti, _)) = pending
-                                .iter()
-                                .min_by(|a, b| a.1.p_max.partial_cmp(&b.1.p_max).unwrap())
-                            {
-                                pending.remove(&worst_ti);
-                            }
-                        }
-                    }
-                }
-                Ok(None) => {
-                    if args.debug {
-                        eprintln!("[rx_tcp][dbg] acq none (elapsed={:?})", t_acq0.elapsed());
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[rx_tcp] acq error: {e:#}");
-                }
-            }
-            if args.debug {
-                let elapsed_s = t_acq0.elapsed().as_secs_f64();
-                let span_s = (n_ti as f64) * p.iv_res_s;
-                let speed_x = if elapsed_s > 0.0 {
-                    span_s / elapsed_s
-                } else {
-                    f64::INFINITY
-                };
-                let backlog_after_s =
-                    (ti_latest.saturating_sub(ti_end.saturating_add(1)) as f64) * p.iv_res_s;
-                eprintln!(
-                    "[rx_tcp][dbg] acq realtime: span={:.3}s, elapsed={:.3}s, speed={:.2}x, backlog={:.3}s -> {:.3}s",
-                    span_s, elapsed_s, speed_x, backlog_before_s, backlog_after_s
-                );
-            }
-            search_cursor_ti = Some(ti_end + 1);
+            self.dbg.pwr_sum += pwr;
         }
     }
 
-    eprintln!("[rx_tcp] connection closed");
-    Ok(())
+    fn maybe_log_debug(&mut self) {
+        if !self.args.debug {
+            return;
+        }
+        if self.dbg.last_dbg.elapsed() < Duration::from_millis(1000) {
+            return;
+        }
+        self.dbg.last_dbg = Instant::now();
+        let pwr_avg = if self.dbg.samp > 0 {
+            self.dbg.pwr_sum / (self.dbg.samp as f64)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[rx_tcp][dbg] ring: len={} (base={}, next={}), raw_avg_power={:.3e}, stash_rem_bytes={}, acq_ready={} (acq_tail_samples={})",
+            self.ring.len(),
+            self.ring.abs_base(),
+            self.ring.abs_next(),
+            pwr_avg,
+            self.stash.len(),
+            self.ring.len() >= self.acq_tail_samples,
+            self.acq_tail_samples
+        );
+        self.dbg.samp = 0;
+        self.dbg.pwr_sum = 0.0;
+    }
+
+    fn process_pending(&mut self) -> anyhow::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut best_ready: Option<Pending> = None;
+        for cand in self.pending.values() {
+            if self.ring.abs_next() < cand.need_abs {
+                continue;
+            }
+            let better = best_ready
+                .as_ref()
+                .map(|b| cand.p_max > b.p_max)
+                .unwrap_or(true);
+            if better {
+                best_ready = Some(cand.clone());
+            }
+        }
+
+        if let Some(cand) = best_ready {
+            let hist = self.modem.rrc.taps.len().saturating_sub(1) as u64;
+            let start_abs = cand.base_abs.saturating_sub(hist);
+            let len = (cand.need_abs - start_abs) as usize;
+            if let Some(y) = self.ring.get_vec(start_abs, len) {
+                let frame_start_sample = (cand.base_abs - start_abs) as usize;
+                let (payload, meta) = self
+                    .modem
+                    .demod_decode_raw(
+                        &y,
+                        cand.ti,
+                        frame_start_sample,
+                        &cand.offsets,
+                        cand.cfo_hz,
+                        self.args.scl_list_size,
+                    )
+                    .unwrap_or_else(|_e| (None, sc_bltc::modem::DecodeMeta::error("demod_error")));
+
+                if let Some(pl) = payload {
+                    let s = String::from_utf8_lossy(&pl);
+                    println!(
+                        "[rx_tcp] decoded: {} (crc_ok={}, ver={}, type={}, len={}, ti_tx={}, p_max={:.3e}, cfo={:.2}Hz, offsets={:?})",
+                        s,
+                        meta.crc_ok,
+                        meta.ver,
+                        meta.typ,
+                        meta.len,
+                        cand.ti,
+                        cand.p_max,
+                        cand.cfo_hz,
+                        cand.offsets
+                    );
+                    self.last_decoded_ti = Some(cand.ti);
+                } else {
+                    eprintln!(
+                        "[rx_tcp] decode failed (crc_ok={}, err={:?}, ver={}, type={}, len={}, ti_tx={}, p_max={:.3e}, cfo={:.2}Hz, offsets={:?})",
+                        meta.crc_ok,
+                        meta.err,
+                        meta.ver,
+                        meta.typ,
+                        meta.len,
+                        cand.ti,
+                        cand.p_max,
+                        cand.cfo_hz,
+                        cand.offsets
+                    );
+                }
+            }
+
+            self.pending.remove(&cand.ti);
+        }
+        Ok(())
+    }
+
+    fn run_acquisition(&mut self) -> anyhow::Result<()> {
+        if self.last_acq.elapsed() < Duration::from_millis(self.args.acq_interval_ms) {
+            return Ok(());
+        }
+        if self.ring.len() <= self.acq_tail_samples {
+            return Ok(());
+        }
+        let Some(t0) = self.t0_s else {
+            return Ok(());
+        };
+
+        self.last_acq = Instant::now();
+        let t_latest =
+            t0 + ((self.ring.abs_next().saturating_sub(self.acq_tail_samples)) as f64) / self.fs;
+        let ti_latest_i = (t_latest / self.p.iv_res_s).floor() as i64;
+        let ti_earliest_i =
+            ((t0 + (self.ring.abs_base() as f64) / self.fs) / self.p.iv_res_s).ceil() as i64;
+
+        let ti_latest = ti_latest_i.max(0) as u64;
+        let mut ti_earliest = ti_earliest_i.max(0) as u64;
+        if ti_latest < ti_earliest {
+            self.search_cursor_ti = Some(ti_earliest);
+            return Ok(());
+        }
+
+        let w_ti = ((self.args.w_sec / self.p.iv_res_s).ceil().max(1.0)) as u64;
+        let ti_floor = ti_latest.saturating_sub(w_ti);
+        ti_earliest = ti_earliest.max(ti_floor);
+
+        if self.search_cursor_ti.is_none() {
+            self.search_cursor_ti = Some(ti_earliest);
+        }
+        let mut next_ti = self.search_cursor_ti.unwrap();
+
+        if next_ti < ti_earliest {
+            if self.args.debug {
+                eprintln!(
+                    "[rx_tcp][dbg] ring overrun: skipped TI {}..{}",
+                    next_ti, ti_earliest
+                );
+            }
+            next_ti = ti_earliest;
+        }
+
+        if next_ti > ti_latest {
+            self.search_cursor_ti = Some(next_ti);
+            return Ok(());
+        }
+
+        let max_batch = 5000u64;
+        let mut ti_end = next_ti + max_batch;
+        if ti_end > ti_latest {
+            ti_end = ti_latest;
+        }
+
+        let n_start_f = ((next_ti as f64) * self.p.iv_res_s - t0) * self.fs;
+        let n_start = n_start_f.round().max(0.0) as u64;
+
+        if n_start < self.ring.abs_base() {
+            let delta_samp = self.ring.abs_base() - n_start;
+            let delta_ti = delta_samp.div_ceil(self.iv_samples);
+            self.search_cursor_ti = Some(next_ti.saturating_add(delta_ti));
+            return Ok(());
+        }
+
+        if n_start.saturating_add(self.acq_tail_samples) > self.ring.abs_next() {
+            self.search_cursor_ti = Some(next_ti);
+            return Ok(());
+        }
+
+        let max_n_ti_by_end = {
+            let slack = self
+                .ring
+                .abs_next()
+                .saturating_sub(n_start)
+                .saturating_sub(self.acq_guard_samples);
+            (slack / self.iv_samples).max(1)
+        };
+        let mut n_ti = ti_end - next_ti + 1;
+        if n_ti > max_n_ti_by_end {
+            n_ti = max_n_ti_by_end;
+            ti_end = next_ti + n_ti - 1;
+        }
+        let n_ti = n_ti as usize;
+
+        let win_len = (n_ti as u64)
+            .saturating_mul(self.iv_samples)
+            .saturating_add(self.acq_guard_samples) as usize;
+
+        let Some(y_win) = self.ring.get_vec(n_start, win_len) else {
+            if self.args.debug {
+                eprintln!(
+                    "[rx_tcp][dbg] acq skipped: ring.get_vec failed (n_start={}, win_len={})",
+                    n_start, win_len
+                );
+            }
+            self.search_cursor_ti = Some(next_ti + 1);
+            return Ok(());
+        };
+
+        if self.args.debug {
+            eprintln!(
+                "[rx_tcp][dbg] acq scan: ti={}..{} (n={}), n_start={}, win_len={}",
+                next_ti, ti_end, n_ti, n_start, win_len
+            );
+        }
+
+        let backlog_before_s = (ti_latest.saturating_sub(next_ti) as f64) * self.p.iv_res_s;
+        let t_acq0 = Instant::now();
+        match self.modem.acquire_fft_raw_window(
+            &y_win,
+            next_ti,
+            n_ti,
+            self.args.p_fa_total,
+            self.args.n_finger,
+        ) {
+            Ok(Some(acq)) => {
+                if self.last_decoded_ti != Some(acq.ti_hat) {
+                    let base_abs = n_start + (acq.ti_hat - next_ti) * self.iv_samples;
+                    let max_off = acq.finger_offsets.iter().copied().max().unwrap_or(acq.n0) as u64;
+                    let decode_need_abs = base_abs
+                        + max_off
+                        + (self.p.frame_samples_with_tail() as u64)
+                        + (4 * self.modem.rrc.delay() as u64)
+                        + 256;
+                    let decode_in_s =
+                        (decode_need_abs.saturating_sub(self.ring.abs_next()) as f64) / self.fs;
+
+                    let cand = Pending {
+                        ti: acq.ti_hat,
+                        base_abs,
+                        offsets: acq.finger_offsets,
+                        cfo_hz: acq.cfo_hat_hz,
+                        p_max: acq.p_max,
+                        need_abs: decode_need_abs,
+                    };
+                    let update = self
+                        .pending
+                        .get(&cand.ti)
+                        .map(|old| cand.p_max > old.p_max)
+                        .unwrap_or(true);
+                    if update {
+                        if self.args.debug {
+                            eprintln!(
+                                "[rx_tcp][dbg] acq candidate: ti_hat={}, n0={}, p_max={:.3e}, cfo={:.2}Hz, fingers={:?}, base_abs={} (decode_in~{:.1}s)",
+                                acq.ti_hat,
+                                acq.n0,
+                                acq.p_max,
+                                acq.cfo_hat_hz,
+                                cand.offsets,
+                                base_abs,
+                                decode_in_s
+                            );
+                        } else {
+                            eprintln!(
+                                "[rx_tcp] acq: ti_hat={}, n0={}, p_max={:.3e}, cfo={:.2}Hz, fingers={:?}, base_abs={} (decode_in~{:.1}s)",
+                                acq.ti_hat,
+                                acq.n0,
+                                acq.p_max,
+                                acq.cfo_hat_hz,
+                                cand.offsets,
+                                base_abs,
+                                decode_in_s
+                            );
+                        }
+                        self.pending.insert(cand.ti, cand);
+                    }
+
+                    if self.pending.len() > self.max_pending {
+                        if let Some((&worst_ti, _)) = self
+                            .pending
+                            .iter()
+                            .min_by(|a, b| a.1.p_max.partial_cmp(&b.1.p_max).unwrap())
+                        {
+                            self.pending.remove(&worst_ti);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                if self.args.debug {
+                    eprintln!("[rx_tcp][dbg] acq none (elapsed={:?})", t_acq0.elapsed());
+                }
+            }
+            Err(e) => {
+                eprintln!("[rx_tcp] acq error: {e:#}");
+            }
+        }
+        if self.args.debug {
+            let elapsed_s = t_acq0.elapsed().as_secs_f64();
+            let span_s = (n_ti as f64) * self.p.iv_res_s;
+            let speed_x = if elapsed_s > 0.0 {
+                span_s / elapsed_s
+            } else {
+                f64::INFINITY
+            };
+            let backlog_after_s =
+                (ti_latest.saturating_sub(ti_end.saturating_add(1)) as f64) * self.p.iv_res_s;
+            eprintln!(
+                "[rx_tcp][dbg] acq realtime: span={:.3}s, elapsed={:.3}s, speed={:.2}x, backlog={:.3}s -> {:.3}s",
+                span_s, elapsed_s, speed_x, backlog_before_s, backlog_after_s
+            );
+        }
+        self.search_cursor_ti = Some(ti_end + 1);
+        Ok(())
+    }
+
+    fn run(&mut self) -> anyhow::Result<()> {
+        let mut stream = self.accept_connection()?;
+        self.handshake(&mut stream)?;
+
+        loop {
+            let Some(raw) = self.read_samples(&mut stream)? else {
+                break;
+            };
+
+            self.push_samples(&raw);
+            self.maybe_log_debug();
+            self.process_pending()?;
+            self.run_acquisition()?;
+        }
+
+        eprintln!("[rx_tcp] connection closed");
+        Ok(())
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    Receiver::new(Args::parse())?.run()
 }

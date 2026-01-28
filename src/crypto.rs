@@ -17,7 +17,7 @@ pub fn gen_code_aes_ctr(
     type AesCtr = ctr::Ctr128BE<Aes256>;
     let mut cipher = AesCtr::new(key.into(), &iv.into());
 
-    let n_bytes = (length + 7) / 8;
+    let n_bytes = length.div_ceil(8);
     let mut ks = vec![0u8; n_bytes];
     cipher.apply_keystream(&mut ks);
 

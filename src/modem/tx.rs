@@ -63,7 +63,7 @@ impl ScBltcModem {
         }
 
         if p.n_tail > 0 {
-            s.extend(std::iter::repeat(0i8).take(p.n_tail * p.sf));
+            s.extend(std::iter::repeat_n(0i8, p.n_tail * p.sf));
         }
 
         let x = pulse_shape_chips(&s, &self.rrc, p.osf as usize);
@@ -80,8 +80,8 @@ impl ScBltcModem {
         let n_chips = p.n_pre * p.sf;
         let mut c = gen_code_aes_ctr(&self.key, ti_search, n_chips, p.domain_u32);
         // Spec §4.B.2: two-symbol Barker-2 preamble is [+C_seq, -C_seq] over the first 2*SF chips.
-        for j in p.sf..n_chips {
-            c[j] = -c[j];
+        for c_j in c.iter_mut().take(n_chips).skip(p.sf) {
+            *c_j = -*c_j;
         }
         let x = pulse_shape_chips(&c, &self.rrc, p.osf as usize);
         let y = self.rrc.filter_same(&x);
@@ -92,8 +92,8 @@ impl ScBltcModem {
         let p = &self.p;
         let n_chips = p.n_pre * p.sf;
         let mut c = gen_code_aes_ctr(&self.key, ti_search, n_chips, p.domain_u32);
-        for j in p.sf..n_chips {
-            c[j] = -c[j];
+        for c_j in c.iter_mut().take(n_chips).skip(p.sf) {
+            *c_j = -*c_j;
         }
         let x = pulse_shape_chips(&c, &self.rrc, p.osf as usize);
         x[..(p.n_pre * p.chip_samples())].to_vec()

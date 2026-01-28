@@ -1,71 +1,62 @@
-use num_complex::Complex32;
-
-#[derive(Debug)]
-pub struct RingBuffer {
-    buf: Vec<Complex32>,
-    cap: usize,
-    write_pos: usize,
-    total_written: u64,
+#[derive(Debug, Clone)]
+pub struct Ring<T: Copy> {
+    buf: Vec<T>,
+    cap: u64,
+    abs_base: u64,
+    abs_next: u64,
 }
 
-impl RingBuffer {
+impl<T: Copy + Default> Ring<T> {
     pub fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1) as u64;
         Self {
-            buf: vec![Complex32::new(0.0, 0.0); capacity],
-            cap: capacity,
-            write_pos: 0,
-            total_written: 0,
+            buf: vec![T::default(); cap as usize],
+            cap,
+            abs_base: 0,
+            abs_next: 0,
         }
     }
 
-    pub fn total_written(&self) -> u64 {
-        self.total_written
+    pub fn len(&self) -> u64 {
+        self.abs_next - self.abs_base
     }
 
-    pub fn capacity(&self) -> usize {
-        self.cap
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
-    pub fn write(&mut self, mut x: &[Complex32]) {
-        if x.len() >= self.cap {
-            x = &x[x.len() - self.cap..];
-        }
-        let n = x.len();
-        let end = self.write_pos + n;
-        if end <= self.cap {
-            self.buf[self.write_pos..end].copy_from_slice(x);
-        } else {
-            let k = self.cap - self.write_pos;
-            self.buf[self.write_pos..].copy_from_slice(&x[..k]);
-            self.buf[..(end % self.cap)].copy_from_slice(&x[k..]);
-        }
-        self.write_pos = end % self.cap;
-        self.total_written += n as u64;
+    pub fn abs_base(&self) -> u64 {
+        self.abs_base
     }
 
-    /// Returns [abs_start, abs_end) currently kept.
-    pub fn available_range(&self) -> (u64, u64) {
-        let abs_end = self.total_written();
-        let abs_start = abs_end.saturating_sub(self.cap as u64);
-        (abs_start, abs_end)
+    pub fn abs_next(&self) -> u64 {
+        self.abs_next
     }
 
-    pub fn read(&self, abs_start: u64, length: usize) -> anyhow::Result<Vec<Complex32>> {
-        let abs_end = abs_start + length as u64;
-        let (keep_start, keep_end) = self.available_range();
-        if abs_start < keep_start || abs_end > keep_end {
-            anyhow::bail!("requested range not in buffer");
+    pub fn push_slice(&mut self, xs: &[T]) {
+        for &x in xs {
+            let idx = (self.abs_next % self.cap) as usize;
+            self.buf[idx] = x;
+            self.abs_next += 1;
+            if self.abs_next - self.abs_base > self.cap {
+                self.abs_base = self.abs_next - self.cap;
+            }
         }
-        let start_idx = (abs_start as usize) % self.cap;
-        let end_idx = (abs_end as usize) % self.cap;
-        if start_idx < end_idx {
-            Ok(self.buf[start_idx..end_idx].to_vec())
-        } else {
-            let mut out = Vec::with_capacity(length);
-            out.extend_from_slice(&self.buf[start_idx..]);
-            out.extend_from_slice(&self.buf[..end_idx]);
-            debug_assert_eq!(out.len(), length);
-            Ok(out)
+    }
+
+    pub fn get_vec(&self, start_abs: u64, len: usize) -> Option<Vec<T>> {
+        let len_u = len as u64;
+        if start_abs < self.abs_base {
+            return None;
         }
+        if start_abs + len_u > self.abs_next {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len_u {
+            let idx = ((start_abs + i) % self.cap) as usize;
+            out.push(self.buf[idx]);
+        }
+        Some(out)
     }
 }

@@ -10,7 +10,7 @@ pub fn design_2nd_order_loop(loop_bw_hz: f64, damping: f64, update_period_s: f64
     let bw = loop_bw_hz;
     let zeta = damping;
     let t = update_period_s;
-    if !(bw > 0.0) || !(t > 0.0) || !(zeta > 0.0) || !zeta.is_finite() {
+    if bw <= 0.0 || t <= 0.0 || zeta <= 0.0 || !zeta.is_finite() {
         return LoopGains { kp: 0.0, ki: 0.0 };
     }
     let wn = 2.0 * std::f64::consts::PI * bw;

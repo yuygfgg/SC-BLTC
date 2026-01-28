@@ -21,17 +21,17 @@ const INV: [usize; FRAME_BITS] = inv_map();
 
 pub fn interleave_frame_bits(bits: &[u8; FRAME_BITS]) -> [u8; FRAME_BITS] {
     let mut out = [0u8; FRAME_BITS];
-    for j in 0..FRAME_BITS {
+    for (j, out_j) in out.iter_mut().enumerate() {
         let i = (A * j + B) & (FRAME_BITS - 1);
-        out[j] = bits[i] & 1;
+        *out_j = bits[i] & 1;
     }
     out
 }
 
 pub fn deinterleave_frame_llr(llr_int: &[f64; FRAME_BITS]) -> [f64; FRAME_BITS] {
     let mut out = [0f64; FRAME_BITS];
-    for i in 0..FRAME_BITS {
-        out[i] = llr_int[INV[i]];
+    for (i, out_i) in out.iter_mut().enumerate() {
+        *out_i = llr_int[INV[i]];
     }
     out
 }

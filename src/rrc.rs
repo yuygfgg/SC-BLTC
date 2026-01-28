@@ -4,7 +4,7 @@ pub fn rrc_taps(alpha: f64, sps: u32, span_symbols: u32) -> anyhow::Result<Vec<f
     if !(0.0 < alpha && alpha <= 1.0) {
         anyhow::bail!("alpha must be in (0,1]");
     }
-    if span_symbols == 0 || (span_symbols % 2) != 0 {
+    if span_symbols == 0 || !span_symbols.is_multiple_of(2) {
         anyhow::bail!("span_symbols must be a positive even integer");
     }
     if sps == 0 {
@@ -16,16 +16,16 @@ pub fn rrc_taps(alpha: f64, sps: u32, span_symbols: u32) -> anyhow::Result<Vec<f
     let sps_f = sps as f64;
 
     let mut h = vec![0f64; n_taps];
-    for i in 0..n_taps {
+    for (i, h_i) in h.iter_mut().enumerate() {
         let ti = (i as f64 - center) / sps_f;
         if ti.abs() < 1e-12 {
-            h[i] = 1.0 - alpha + 4.0 * alpha / std::f64::consts::PI;
+            *h_i = 1.0 - alpha + 4.0 * alpha / std::f64::consts::PI;
             continue;
         }
         let sing = (1.0 / (4.0 * alpha)).abs();
         if (ti.abs() - sing).abs() < 1e-9 {
             let a = alpha;
-            h[i] = (a / 2.0_f64.sqrt())
+            *h_i = (a / 2.0_f64.sqrt())
                 * ((1.0 + 2.0 / std::f64::consts::PI) * (std::f64::consts::PI / (4.0 * a)).sin()
                     + (1.0 - 2.0 / std::f64::consts::PI)
                         * (std::f64::consts::PI / (4.0 * a)).cos());
@@ -36,7 +36,7 @@ pub fn rrc_taps(alpha: f64, sps: u32, span_symbols: u32) -> anyhow::Result<Vec<f
         let num = (std::f64::consts::PI * ti * (1.0 - a)).sin()
             + 4.0 * a * ti * (std::f64::consts::PI * ti * (1.0 + a)).cos();
         let den = std::f64::consts::PI * ti * (1.0 - (4.0 * a * ti).powi(2));
-        h[i] = num / den;
+        *h_i = num / den;
     }
 
     let e: f64 = h.iter().map(|v| v * v).sum();

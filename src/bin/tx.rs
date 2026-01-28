@@ -416,6 +416,7 @@ fn build_random_multipath(
     normalize_taps(taps)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_channel_sample(
     x: Complex32,
     amp: f32,
@@ -455,6 +456,7 @@ fn apply_channel_sample(
     y
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_silence_samples(
     tx: &mut TcpDelay,
     buf: &mut [Complex32],
@@ -515,253 +517,290 @@ fn send_block_paced(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let p = Params::default();
-    let key = parse_key_hex(&args.key_hex)?;
-    let modem = ScBltcModem::new(p.clone(), key)?;
+struct Transmitter {
+    args: Args,
+    p: Params,
+    modem: ScBltcModem,
+}
 
-    let mut stream =
-        TcpStream::connect(&args.addr).with_context(|| format!("connect {}", args.addr))?;
-    if args.write_timeout_ms > 0 {
-        stream
-            .set_write_timeout(Some(Duration::from_millis(args.write_timeout_ms)))
-            .context("set_write_timeout")?;
-    }
-    stream.set_nodelay(true).ok();
-
-    stream.write_all(MAGIC).context("write magic")?;
-    write_u32_le(&mut stream, p.fs_hz).context("write fs_hz")?;
-    stream.flush().ok();
-
-    eprintln!(
-        "[tx_tcp] connected to {} (fs={}Hz), streaming I/Q f32 LE continuously (tcp_delay_ms={})",
-        args.addr, p.fs_hz, args.tcp_delay_ms
-    );
-
-    let fs_nom_hz = p.fs_hz as f64;
-    let fs_actual_hz = fs_nom_hz * (1.0 + args.sro_ppm * 1e-6);
-    if fs_actual_hz <= 0.0 {
-        anyhow::bail!("fs_actual_hz must be positive (check --sro_ppm)");
-    }
-    let iv_samples = (fs_nom_hz * p.iv_res_s).round() as u64;
-
-    if args.start_delay_s > 0.0 {
-        std::thread::sleep(Duration::from_secs_f64(args.start_delay_s.max(0.0)));
+impl Transmitter {
+    fn new(args: Args) -> anyhow::Result<Self> {
+        let p = Params::default();
+        let key = parse_key_hex(&args.key_hex)?;
+        let modem = ScBltcModem::new(p.clone(), key)?;
+        Ok(Self { args, p, modem })
     }
 
-    // Spec §1, §4.B.1.
-    let fs_u64 = p.fs_hz as u64;
-    let ts_ns = 1_000_000_000u64 / fs_u64;
-    let now_ns = unix_now_ns_u64();
-    let min_future_ns = now_ns.saturating_add(5_000_000);
-    let stream_t0_wall_ns = ((min_future_ns + ts_ns - 1) / ts_ns) * ts_ns;
-    write_u64_le(&mut stream, stream_t0_wall_ns).context("write t0_ns")?;
-    stream.flush().ok();
-
-    let mut tx = TcpDelay::new(stream, Duration::from_millis(args.tcp_delay_ms));
-
-    let mut rng = Rng64::new(args.seed);
-    let mut gauss = Gauss::new();
-
-    let stream_t0_wall = (stream_t0_wall_ns as f64) * 1e-9;
-    loop {
-        let now = unix_now_ns_u64();
-        if now >= stream_t0_wall_ns {
-            break;
+    fn connect_stream(&self) -> anyhow::Result<TcpStream> {
+        let stream = TcpStream::connect(&self.args.addr)
+            .with_context(|| format!("connect {}", self.args.addr))?;
+        if self.args.write_timeout_ms > 0 {
+            stream
+                .set_write_timeout(Some(Duration::from_millis(self.args.write_timeout_ms)))
+                .context("set_write_timeout")?;
         }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let stream_t0_inst = Instant::now();
-    let mut n_sent: u64 = 0;
-
-    let mp = if !args.mp_tap.is_empty() {
-        let mut max_d = 0usize;
-        let mut min_d = usize::MAX;
-        let mut has_d0 = false;
-        let mut entries: Vec<(usize, Complex32)> = Vec::with_capacity(args.mp_tap.len());
-        for s in &args.mp_tap {
-            let (d, g) = parse_mp_tap(s, &mut rng)?;
-            max_d = max_d.max(d);
-            min_d = min_d.min(d);
-            has_d0 |= d == 0;
-            entries.push((d, g));
-        }
-        if !has_d0 {
-            eprintln!(
-                "[tx_tcp][warn] mp_tap has no delay-0 direct path; earliest tap at {} samples (IV={} samples). \
-                 If you intended multipath, repeat --mp-tap and include e.g. --mp-tap 0,0.",
-                min_d,
-                iv_samples
-            );
-        }
-        let mut taps = vec![Complex32::new(0.0, 0.0); max_d + 1];
-        for (d, g) in entries {
-            taps[d] += g;
-        }
-        Some(MultipathFir::new(normalize_taps(taps))?)
-    } else if args.mp_paths > 0 {
-        Some(MultipathFir::new(build_random_multipath(
-            args.mp_paths,
-            args.mp_max_delay_samp,
-            args.mp_decay_db_per_samp,
-            &mut rng,
-            &mut gauss,
-        ))?)
-    } else {
-        None
-    };
-
-    let doppler = if args.doppler_std_hz > 0.0 {
-        let mut d = DopplerOu::new(
-            args.doppler_std_hz,
-            args.doppler_tau_s,
-            fs_actual_hz,
-            args.doppler_max_hz,
-        );
-        d.f_hz = args.doppler_std_hz * (gauss.next(&mut rng) as f64);
-        if d.max_abs_hz > 0.0 {
-            d.f_hz = d.f_hz.clamp(-d.max_abs_hz, d.max_abs_hz);
-        }
-        Some(d)
-    } else {
-        None
-    };
-
-    let mut ch = ChannelState {
-        phi: 0.0,
-        mp,
-        doppler,
-    };
-
-    eprintln!(
-        "[tx_tcp] channel: fs_actual={:.3}Hz (sro_ppm={:+.3}), mp={}, doppler_std_hz={:.3}",
-        fs_actual_hz,
-        args.sro_ppm,
-        if ch.mp.is_some() { "on" } else { "off" },
-        args.doppler_std_hz
-    );
-
-    let mut silence_buf = vec![Complex32::new(0.0, 0.0); 1024];
-    if args.lead_s > 0.0 {
-        let n0 = (args.lead_s * fs_actual_hz).round() as usize;
-        send_silence_samples(
-            &mut tx,
-            &mut silence_buf,
-            &args,
-            &mut ch,
-            &mut rng,
-            &mut gauss,
-            fs_actual_hz,
-            stream_t0_inst,
-            &mut n_sent,
-            n0,
-        )?;
+        stream.set_nodelay(true).ok();
+        Ok(stream)
     }
 
-    eprintln!("[tx_tcp] type a line and press Enter to send (Ctrl-D to quit)");
-    let stdin_rx = spawn_stdin_lines(std::io::stdin());
-    let mut stdin_eof = false;
-    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
-
-    let mut frame_idx: u64 = 0;
-    loop {
-        if args.frames != 0 && frame_idx >= args.frames {
-            break;
-        }
-
-        while let Ok(m) = stdin_rx.try_recv() {
-            match m {
-                Some(s) => pending.push_back(s.into_bytes()),
-                None => stdin_eof = true,
-            }
-        }
-
-        let payload = if let Some(mut b) = pending.pop_front() {
-            b.truncate(26); // Spec §3.A0.
-            b
-        } else {
-            if stdin_eof {
-                break;
-            }
-            // Keep streaming silence while waiting for user input.
-            let n = silence_buf.len();
-            send_silence_samples(
-                &mut tx,
-                &mut silence_buf,
-                &args,
-                &mut ch,
-                &mut rng,
-                &mut gauss,
-                fs_actual_hz,
-                stream_t0_inst,
-                &mut n_sent,
-                n,
-            )?;
-            continue;
-        };
-
-        // Spec §4.B.1.
-        let t_next_sample = stream_t0_wall + (n_sent as f64) / fs_actual_hz;
-        let t_base = t_next_sample + args.gap_s.max(0.0);
-        let mut ti = (t_base / p.iv_res_s).floor() as u64 + 1;
-        let n_off = (rng.next_u64() % iv_samples) as u64;
-        let mut t_frame = (ti as f64) * p.iv_res_s + (n_off as f64) / fs_nom_hz;
-        if t_frame < t_base {
-            ti += 1;
-            t_frame = (ti as f64) * p.iv_res_s + (n_off as f64) / fs_nom_hz;
-        }
-
-        let n_target = ((t_frame - stream_t0_wall) * fs_actual_hz).round() as i64;
-        let n_sil = (n_target - (n_sent as i64)).max(0) as usize;
-        if n_sil > 0 {
-            send_silence_samples(
-                &mut tx,
-                &mut silence_buf,
-                &args,
-                &mut ch,
-                &mut rng,
-                &mut gauss,
-                fs_actual_hz,
-                stream_t0_inst,
-                &mut n_sent,
-                n_sil,
-            )?;
-        }
-
-        let frame = modem
-            .build_frame_samples(&payload, args.ver, args.typ, Some(t_frame))
-            .context("build_frame_samples")?;
+    fn write_handshake(&self, stream: &mut TcpStream) -> anyhow::Result<u64> {
+        stream.write_all(MAGIC).context("write magic")?;
+        write_u32_le(stream, self.p.fs_hz).context("write fs_hz")?;
+        stream.flush().ok();
 
         eprintln!(
-            "[tx_tcp] frame={} ti_tx={} iv_off_samp={} t_frame={:.6}",
-            frame_idx, frame.ti_tx, n_off, t_frame
+            "[tx_tcp] connected to {} (fs={}Hz), streaming I/Q f32 LE continuously (tcp_delay_ms={})",
+            self.args.addr, self.p.fs_hz, self.args.tcp_delay_ms
         );
 
-        let mut tmp = Vec::with_capacity(2048);
-        for &x in &frame.samples {
-            tmp.push(apply_channel_sample(
-                x,
-                args.amp,
-                args.cfo_hz,
+        let fs_u64 = self.p.fs_hz as u64;
+        let ts_ns = 1_000_000_000u64 / fs_u64;
+        let now_ns = unix_now_ns_u64();
+        let min_future_ns = now_ns.saturating_add(5_000_000);
+        let stream_t0_wall_ns = min_future_ns.div_ceil(ts_ns) * ts_ns;
+        write_u64_le(stream, stream_t0_wall_ns).context("write t0_ns")?;
+        stream.flush().ok();
+        Ok(stream_t0_wall_ns)
+    }
+
+    fn build_channel(
+        &self,
+        rng: &mut Rng64,
+        gauss: &mut Gauss,
+        fs_actual_hz: f64,
+        iv_samples: u64,
+    ) -> anyhow::Result<ChannelState> {
+        let mp = if !self.args.mp_tap.is_empty() {
+            let mut max_d = 0usize;
+            let mut min_d = usize::MAX;
+            let mut has_d0 = false;
+            let mut entries: Vec<(usize, Complex32)> = Vec::with_capacity(self.args.mp_tap.len());
+            for s in &self.args.mp_tap {
+                let (d, g) = parse_mp_tap(s, rng)?;
+                max_d = max_d.max(d);
+                min_d = min_d.min(d);
+                has_d0 |= d == 0;
+                entries.push((d, g));
+            }
+            if !has_d0 {
+                eprintln!(
+                    "[tx_tcp][warn] mp_tap has no delay-0 direct path; earliest tap at {} samples (IV={} samples). \
+                     If you intended multipath, repeat --mp-tap and include e.g. --mp-tap 0,0.",
+                    min_d,
+                    iv_samples
+                );
+            }
+            let mut taps = vec![Complex32::new(0.0, 0.0); max_d + 1];
+            for (d, g) in entries {
+                taps[d] += g;
+            }
+            Some(MultipathFir::new(normalize_taps(taps))?)
+        } else if self.args.mp_paths > 0 {
+            Some(MultipathFir::new(build_random_multipath(
+                self.args.mp_paths,
+                self.args.mp_max_delay_samp,
+                self.args.mp_decay_db_per_samp,
+                rng,
+                gauss,
+            ))?)
+        } else {
+            None
+        };
+
+        let doppler = if self.args.doppler_std_hz > 0.0 {
+            let mut d = DopplerOu::new(
+                self.args.doppler_std_hz,
+                self.args.doppler_tau_s,
                 fs_actual_hz,
-                args.noise_std,
+                self.args.doppler_max_hz,
+            );
+            d.f_hz = self.args.doppler_std_hz * (gauss.next(rng) as f64);
+            if d.max_abs_hz > 0.0 {
+                d.f_hz = d.f_hz.clamp(-d.max_abs_hz, d.max_abs_hz);
+            }
+            Some(d)
+        } else {
+            None
+        };
+
+        Ok(ChannelState {
+            phi: 0.0,
+            mp,
+            doppler,
+        })
+    }
+
+    fn wait_for_start(&self, stream_t0_wall_ns: u64) {
+        loop {
+            let now = unix_now_ns_u64();
+            if now >= stream_t0_wall_ns {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn run(&self) -> anyhow::Result<()> {
+        if self.args.start_delay_s > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(self.args.start_delay_s.max(0.0)));
+        }
+
+        let mut stream = self.connect_stream()?;
+        let stream_t0_wall_ns = self.write_handshake(&mut stream)?;
+
+        let fs_nom_hz = self.p.fs_hz as f64;
+        let fs_actual_hz = fs_nom_hz * (1.0 + self.args.sro_ppm * 1e-6);
+        if fs_actual_hz <= 0.0 {
+            anyhow::bail!("fs_actual_hz must be positive (check --sro_ppm)");
+        }
+        let iv_samples = (fs_nom_hz * self.p.iv_res_s).round() as u64;
+
+        let mut tx = TcpDelay::new(stream, Duration::from_millis(self.args.tcp_delay_ms));
+
+        let mut rng = Rng64::new(self.args.seed);
+        let mut gauss = Gauss::new();
+
+        let stream_t0_wall = (stream_t0_wall_ns as f64) * 1e-9;
+        self.wait_for_start(stream_t0_wall_ns);
+        let stream_t0_inst = Instant::now();
+        let mut n_sent: u64 = 0;
+
+        let mut ch = self.build_channel(&mut rng, &mut gauss, fs_actual_hz, iv_samples)?;
+
+        eprintln!(
+            "[tx_tcp] channel: fs_actual={:.3}Hz (sro_ppm={:+.3}), mp={}, doppler_std_hz={:.3}",
+            fs_actual_hz,
+            self.args.sro_ppm,
+            if ch.mp.is_some() { "on" } else { "off" },
+            self.args.doppler_std_hz
+        );
+
+        let mut silence_buf = vec![Complex32::new(0.0, 0.0); 1024];
+        if self.args.lead_s > 0.0 {
+            let n0 = (self.args.lead_s * fs_actual_hz).round() as usize;
+            send_silence_samples(
+                &mut tx,
+                &mut silence_buf,
+                &self.args,
                 &mut ch,
                 &mut rng,
                 &mut gauss,
-            ));
-            if tmp.len() >= 2048 {
-                send_block_paced(&mut tx, &tmp, fs_actual_hz, stream_t0_inst, &mut n_sent)?;
-                tmp.clear();
+                fs_actual_hz,
+                stream_t0_inst,
+                &mut n_sent,
+                n0,
+            )?;
+        }
+
+        eprintln!("[tx_tcp] type a line and press Enter to send (Ctrl-D to quit)");
+        let stdin_rx = spawn_stdin_lines(std::io::stdin());
+        let mut stdin_eof = false;
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+
+        let mut frame_idx: u64 = 0;
+        loop {
+            if self.args.frames != 0 && frame_idx >= self.args.frames {
+                break;
             }
-        }
-        if !tmp.is_empty() {
-            send_block_paced(&mut tx, &tmp, fs_actual_hz, stream_t0_inst, &mut n_sent)?;
+
+            while let Ok(m) = stdin_rx.try_recv() {
+                match m {
+                    Some(s) => pending.push_back(s.into_bytes()),
+                    None => stdin_eof = true,
+                }
+            }
+
+            let payload = if let Some(mut b) = pending.pop_front() {
+                b.truncate(26); // Spec §3.A0.
+                b
+            } else {
+                if stdin_eof {
+                    break;
+                }
+                // Keep streaming silence while waiting for user input.
+                let n = silence_buf.len();
+                send_silence_samples(
+                    &mut tx,
+                    &mut silence_buf,
+                    &self.args,
+                    &mut ch,
+                    &mut rng,
+                    &mut gauss,
+                    fs_actual_hz,
+                    stream_t0_inst,
+                    &mut n_sent,
+                    n,
+                )?;
+                continue;
+            };
+
+            // Spec §4.B.1.
+            let t_next_sample = stream_t0_wall + (n_sent as f64) / fs_actual_hz;
+            let t_base = t_next_sample + self.args.gap_s.max(0.0);
+            let mut ti = (t_base / self.p.iv_res_s).floor() as u64 + 1;
+            let n_off = rng.next_u64() % iv_samples;
+            let mut t_frame = (ti as f64) * self.p.iv_res_s + (n_off as f64) / fs_nom_hz;
+            if t_frame < t_base {
+                ti += 1;
+                t_frame = (ti as f64) * self.p.iv_res_s + (n_off as f64) / fs_nom_hz;
+            }
+
+            let n_target = ((t_frame - stream_t0_wall) * fs_actual_hz).round() as i64;
+            let n_sil = (n_target - (n_sent as i64)).max(0) as usize;
+            if n_sil > 0 {
+                send_silence_samples(
+                    &mut tx,
+                    &mut silence_buf,
+                    &self.args,
+                    &mut ch,
+                    &mut rng,
+                    &mut gauss,
+                    fs_actual_hz,
+                    stream_t0_inst,
+                    &mut n_sent,
+                    n_sil,
+                )?;
+            }
+
+            let frame = self
+                .modem
+                .build_frame_samples(&payload, self.args.ver, self.args.typ, Some(t_frame))
+                .context("build_frame_samples")?;
+
+            eprintln!(
+                "[tx_tcp] frame={} ti_tx={} iv_off_samp={} t_frame={:.6}",
+                frame_idx, frame.ti_tx, n_off, t_frame
+            );
+
+            let mut tmp = Vec::with_capacity(2048);
+            for &x in &frame.samples {
+                tmp.push(apply_channel_sample(
+                    x,
+                    self.args.amp,
+                    self.args.cfo_hz,
+                    fs_actual_hz,
+                    self.args.noise_std,
+                    &mut ch,
+                    &mut rng,
+                    &mut gauss,
+                ));
+                if tmp.len() >= 2048 {
+                    send_block_paced(&mut tx, &tmp, fs_actual_hz, stream_t0_inst, &mut n_sent)?;
+                    tmp.clear();
+                }
+            }
+            if !tmp.is_empty() {
+                send_block_paced(&mut tx, &tmp, fs_actual_hz, stream_t0_inst, &mut n_sent)?;
+            }
+
+            frame_idx += 1;
         }
 
-        frame_idx += 1;
+        tx.drain().ok();
+        Ok(())
     }
+}
 
-    tx.drain().ok();
-    Ok(())
+fn main() -> anyhow::Result<()> {
+    Transmitter::new(Args::parse())?.run()
 }

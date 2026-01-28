@@ -6,10 +6,10 @@ pub fn walsh_row(m: u16, n: usize) -> Vec<i8> {
         panic!("m must be in [0,n)");
     }
     let mut out = vec![0i8; n];
-    for j in 0..n {
+    for (j, out_j) in out.iter_mut().enumerate() {
         let v = (m as u32) & (j as u32);
-        let parity = (v.count_ones() & 1) as u32;
-        out[j] = if parity == 0 { 1 } else { -1 };
+        let parity = v.count_ones() & 1;
+        *out_j = if parity == 0 { 1 } else { -1 };
     }
     out
 }

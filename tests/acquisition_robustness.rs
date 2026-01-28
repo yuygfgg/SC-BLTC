@@ -1,6 +1,6 @@
 use num_complex::Complex32;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use sc_bltc::modem::ScBltcModem;
 use sc_bltc::params::Params;

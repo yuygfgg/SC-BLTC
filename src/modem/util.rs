@@ -3,7 +3,7 @@ use num_complex::Complex32;
 
 pub(super) fn is_pilot(ell: usize) -> bool {
     // Spec §3 / §4: pilots start after the 2-symbol preamble.
-    ell >= 2 && ((ell - 2) % 5 == 0)
+    ell >= 2 && (ell - 2).is_multiple_of(5)
 }
 
 pub(super) fn wrap_pm_pi(x: f64) -> f64 {
@@ -11,7 +11,7 @@ pub(super) fn wrap_pm_pi(x: f64) -> f64 {
 }
 
 pub(super) fn bits_to_symbols(bits: &[u8], k: usize) -> Vec<u16> {
-    assert!(bits.len() % k == 0);
+    assert!(bits.len().is_multiple_of(k));
     let mut out = Vec::with_capacity(bits.len() / k);
     for chunk in bits.chunks_exact(k) {
         let mut v = 0u16;

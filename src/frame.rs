@@ -57,14 +57,14 @@ fn bytes_to_bits_be(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() * 8);
     for &b in bytes {
         for bit in (0..8).rev() {
-            out.push(((b >> bit) & 1) as u8);
+            out.push((b >> bit) & 1);
         }
     }
     out
 }
 
 fn bits_be_to_bytes(bits: &[u8]) -> Vec<u8> {
-    assert!(bits.len() % 8 == 0);
+    assert!(bits.len().is_multiple_of(8));
     let mut out = Vec::with_capacity(bits.len() / 8);
     for chunk in bits.chunks_exact(8) {
         let mut b = 0u8;
