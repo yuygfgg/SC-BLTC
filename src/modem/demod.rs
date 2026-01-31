@@ -7,6 +7,7 @@ use crate::polar::polar_decode_to_u256_from_llr;
 use crate::tracking::{design_2nd_order_loop, EarlyLateDll};
 use crate::walsh::{fht1024_in_place, walsh_row};
 use num_complex::Complex32;
+use std::cmp::Ordering;
 
 type FingerVec = Vec<Complex32>;
 type FingerSamples = Vec<FingerVec>;
@@ -226,7 +227,16 @@ impl<'a> SymbolTracker<'a> {
         let i_ref = pre_corr
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.norm().partial_cmp(&b.1.norm()).unwrap())
+            .max_by(|a, b| {
+                let an = a.1.norm();
+                let bn = b.1.norm();
+                match (an.is_finite(), bn.is_finite()) {
+                    (true, true) => an.total_cmp(&bn),
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => Ordering::Equal,
+                }
+            })
             .map(|(i, _)| i)
             .unwrap_or(0);
         let theta = pre_corr[i_ref].arg() as f64;
@@ -573,8 +583,10 @@ impl<'a> SymbolTracker<'a> {
             let den = z_dd.norm();
             if den > 1e-6 {
                 let rot = z_dd.conj() / den;
-                for v in r_data_all.last_mut().unwrap().iter_mut() {
-                    *v *= rot;
+                if let Some(last) = r_data_all.last_mut() {
+                    for v in last.iter_mut() {
+                        *v *= rot;
+                    }
                 }
             }
 

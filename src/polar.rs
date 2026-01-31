@@ -1,4 +1,5 @@
 use crate::frame;
+use std::sync::OnceLock;
 
 pub const POLAR_N: usize = 512;
 pub const POLAR_K: usize = 256;
@@ -62,22 +63,33 @@ fn polar_pw_order(n: usize) -> Vec<usize> {
     idx_w.into_iter().map(|(i, _)| i).collect()
 }
 
-fn frozen_and_info_positions() -> ([bool; POLAR_N], [usize; POLAR_K]) {
-    let order = polar_pw_order(POLAR_N);
-    let mut frozen = [true; POLAR_N];
-    for &i in &order[POLAR_N - POLAR_K..] {
-        frozen[i] = false;
-    }
+struct PolarConst {
+    frozen: [bool; POLAR_N],
+    info_pos: [usize; POLAR_K],
+}
 
-    let mut info: Vec<usize> = frozen
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &is_frozen)| if is_frozen { None } else { Some(i) })
-        .collect();
-    info.sort_unstable();
-    let info: [usize; POLAR_K] = info.try_into().unwrap();
+static POLAR_CONST: OnceLock<PolarConst> = OnceLock::new();
 
-    (frozen, info)
+fn polar_const() -> &'static PolarConst {
+    POLAR_CONST.get_or_init(|| {
+        let order = polar_pw_order(POLAR_N);
+        let mut frozen = [true; POLAR_N];
+        for &i in &order[POLAR_N - POLAR_K..] {
+            frozen[i] = false;
+        }
+
+        // Info positions in ascending index order
+        let mut info_pos = [0usize; POLAR_K];
+        let mut j = 0usize;
+        for (i, &frozen) in frozen.iter().enumerate().take(POLAR_N) {
+            if !frozen {
+                info_pos[j] = i;
+                j += 1;
+            }
+        }
+        debug_assert_eq!(j, POLAR_K);
+        PolarConst { frozen, info_pos }
+    })
 }
 
 fn polar_transform_in_place(x: &mut [u8]) {
@@ -98,7 +110,7 @@ fn polar_transform_in_place(x: &mut [u8]) {
 
 /// Spec §3.A0: (N,K)=(512,256)
 pub fn polar_encode_u256(u_bits: &[u8; POLAR_K]) -> [u8; POLAR_N] {
-    let (_frozen, info_pos) = frozen_and_info_positions();
+    let info_pos = &polar_const().info_pos;
     let mut u = [0u8; POLAR_N];
     for (j, &pos) in info_pos.iter().enumerate() {
         u[pos] = u_bits[j] & 1;
@@ -212,7 +224,8 @@ fn decode_node(
 
 /// CRC-aided SCL decoder for Spec §4.D: returns the decoded 256-bit `U` payload (header+payload+crc+pad).
 pub fn polar_decode_to_u256_from_llr(llr_in: &[f64; POLAR_N], list_size: usize) -> [u8; POLAR_K] {
-    let (frozen, info_pos) = frozen_and_info_positions();
+    let frozen = &polar_const().frozen;
+    let info_pos = &polar_const().info_pos;
     let l = list_size.clamp(1, 64);
 
     let p0 = Path {
@@ -225,7 +238,7 @@ pub fn polar_decode_to_u256_from_llr(llr_in: &[f64; POLAR_N], list_size: usize) 
 
     // Root decode fills `u` and returns the (reconstructed) codeword in `x_ret`.
     let mut paths = vec![p0];
-    decode_node(&mut paths, 0, POLAR_N, &frozen, l);
+    decode_node(&mut paths, 0, POLAR_N, frozen, l);
 
     // CRC-aided selection on the extracted U-bits.
     let mut best_crc: Option<([u8; POLAR_K], f64)> = None;

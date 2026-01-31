@@ -136,12 +136,11 @@ fn write_u64_le(w: &mut impl Write, x: u64) -> io::Result<()> {
     w.write_all(&x.to_le_bytes())
 }
 
-fn unix_now_ns_u64() -> u64 {
-    SystemTime::now()
+fn unix_now_ns_u64() -> anyhow::Result<u64> {
+    let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64
+        .context("system clock is before UNIX_EPOCH")?;
+    Ok(d.as_nanos().min(u128::from(u64::MAX)) as u64)
 }
 
 fn spawn_stdin_lines(stdin: Stdin) -> mpsc::Receiver<Option<String>> {
@@ -192,7 +191,7 @@ impl TcpDelay {
             if *due > now {
                 break;
             }
-            let (_, bytes) = self.q.pop_front().expect("front exists");
+            let (_, bytes) = self.q.pop_front().expect("Front should exist");
             self.queued_bytes = self.queued_bytes.saturating_sub(bytes.len());
             self.stream
                 .write_all(&bytes)
@@ -336,7 +335,7 @@ impl Transmitter {
 
         let fs_u64 = self.p.fs_hz as u64;
         let ts_ns = 1_000_000_000u64 / fs_u64;
-        let now_ns = unix_now_ns_u64();
+        let now_ns = unix_now_ns_u64()?;
         let min_future_ns = now_ns.saturating_add(5_000_000);
         let stream_t0_wall_ns = min_future_ns.div_ceil(ts_ns) * ts_ns;
         write_u64_le(stream, stream_t0_wall_ns).context("write t0_ns")?;
@@ -404,14 +403,15 @@ impl Transmitter {
         Ok(ChannelState::new(mp, doppler))
     }
 
-    fn wait_for_start(&self, stream_t0_wall_ns: u64) {
+    fn wait_for_start(&self, stream_t0_wall_ns: u64) -> anyhow::Result<()> {
         loop {
-            let now = unix_now_ns_u64();
+            let now = unix_now_ns_u64()?;
             if now >= stream_t0_wall_ns {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        Ok(())
     }
 
     fn run(&self) -> anyhow::Result<()> {
@@ -435,7 +435,7 @@ impl Transmitter {
         let mut gauss = Gauss::new();
 
         let stream_t0_wall = (stream_t0_wall_ns as f64) * 1e-9;
-        self.wait_for_start(stream_t0_wall_ns);
+        self.wait_for_start(stream_t0_wall_ns)?;
         let stream_t0_inst = Instant::now();
         let mut n_sent: u64 = 0;
 

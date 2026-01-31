@@ -391,7 +391,7 @@ impl ScBltcModem {
                     let ref_pre_conj = &ctx.ref_pre_conj_by_ti[ti_idx];
                     let pilots = pilot_ref_conj_by_ti[ti_idx]
                         .as_ref()
-                        .expect("missing pilot refs for candidate TI");
+                        .expect("Pilot refs should exist for candidate TI");
 
                     for (dst, (r, c)) in y_pre.iter_mut().zip(
                         rx_window[y0..y0 + ctx.n_ref_pre]
@@ -589,7 +589,7 @@ impl ScBltcModem {
         p_fa_total: f64,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
-        let _ = p_fa_total;
+        let _ = p_fa_total; // TODO
         self.acquire_fft_window_impl(rx_raw_window, ti_min, n_ti, n_finger, false)
     }
 
@@ -601,7 +601,7 @@ impl ScBltcModem {
         p_fa_total: f64,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
-        let _ = p_fa_total;
+        let _ = p_fa_total; // TODO
         self.acquire_fft_window_impl(y_matched_window, ti_min, n_ti, n_finger, true)
     }
 }

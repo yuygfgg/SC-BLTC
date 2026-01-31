@@ -110,8 +110,10 @@ struct SignalBuffer {
     pending: HashMap<u64, Pending>,
     max_pending: usize,
     stash: Vec<u8>,
+    stash_off: usize,
     io_buf: Vec<u8>,
     raw_buf: Vec<Complex32>,
+    win_buf: Vec<Complex32>,
 }
 
 struct ReceiverState {
@@ -166,8 +168,10 @@ impl Receiver {
                 pending: HashMap::new(),
                 max_pending: 8,
                 stash: Vec::new(),
+                stash_off: 0,
                 io_buf: vec![0u8; 32 * 1024],
                 raw_buf: Vec::new(),
+                win_buf: Vec::new(),
             },
             state: ReceiverState {
                 t0_s: None,
@@ -235,7 +239,12 @@ impl Receiver {
             .stash
             .extend_from_slice(&self.signal.io_buf[..n]);
 
-        let n_samp = self.signal.stash.len() / 8;
+        let avail = self
+            .signal
+            .stash
+            .len()
+            .saturating_sub(self.signal.stash_off);
+        let n_samp = avail / 8;
         if n_samp == 0 {
             return Ok(Some(0));
         }
@@ -243,13 +252,22 @@ impl Receiver {
         let raw = &mut self.signal.raw_buf;
         raw.clear();
         raw.reserve(n_samp);
-        for i in 0..n_samp {
-            let off = i * 8;
-            let re = f32::from_le_bytes(self.signal.stash[off..off + 4].try_into().unwrap());
-            let im = f32::from_le_bytes(self.signal.stash[off + 4..off + 8].try_into().unwrap());
-            raw.push(Complex32::new(re, im));
+        let bytes = &self.signal.stash[self.signal.stash_off..self.signal.stash_off + used];
+        for chunk in bytes.chunks_exact(8) {
+            let mut re_b = [0u8; 4];
+            let mut im_b = [0u8; 4];
+            re_b.copy_from_slice(&chunk[..4]);
+            im_b.copy_from_slice(&chunk[4..]);
+            raw.push(Complex32::new(
+                f32::from_le_bytes(re_b),
+                f32::from_le_bytes(im_b),
+            ));
         }
-        self.signal.stash.drain(..used);
+        self.signal.stash_off += used;
+        if self.signal.stash_off >= 64 * 1024 && self.signal.stash_off <= self.signal.stash.len() {
+            self.signal.stash.drain(..self.signal.stash_off);
+            self.signal.stash_off = 0;
+        }
         Ok(Some(n_samp))
     }
 
@@ -284,7 +302,10 @@ impl Receiver {
             self.signal.ring.abs_base(),
             self.signal.ring.abs_next(),
             pwr_avg,
-            self.signal.stash.len(),
+            self.signal
+                .stash
+                .len()
+                .saturating_sub(self.signal.stash_off),
             self.signal.ring.len() >= self.state.acq_tail_samples,
             self.state.acq_tail_samples
         );
@@ -315,12 +336,18 @@ impl Receiver {
             let hist = self.modem.rrc.taps.len().saturating_sub(1) as u64;
             let start_abs = cand.base_abs.saturating_sub(hist);
             let len = (cand.need_abs - start_abs) as usize;
-            if let Some(y) = self.signal.ring.get_vec(start_abs, len) {
+            if self
+                .signal
+                .ring
+                .copy_into(start_abs, len, &mut self.signal.win_buf)
+                .is_some()
+            {
+                let y = &self.signal.win_buf;
                 let frame_start_sample = (cand.base_abs - start_abs) as usize;
                 let (payload, meta) = self
                     .modem
                     .demod_decode_raw(
-                        &y,
+                        y,
                         cand.ti,
                         frame_start_sample,
                         &cand.offsets,
@@ -403,7 +430,13 @@ impl Receiver {
         if self.state.acq.search_cursor_ti.is_none() {
             self.state.acq.search_cursor_ti = Some(ti_earliest);
         }
-        let mut next_ti = self.state.acq.search_cursor_ti.unwrap();
+        let mut next_ti = match self.state.acq.search_cursor_ti {
+            Some(v) => v,
+            None => {
+                self.state.acq.search_cursor_ti = Some(ti_earliest);
+                ti_earliest
+            }
+        };
 
         if next_ti < ti_earliest {
             if self.args.debug {
@@ -461,16 +494,22 @@ impl Receiver {
             .saturating_mul(self.state.iv_samples)
             .saturating_add(self.state.acq_guard_samples) as usize;
 
-        let Some(y_win) = self.signal.ring.get_vec(n_start, win_len) else {
+        let have = self
+            .signal
+            .ring
+            .copy_into(n_start, win_len, &mut self.signal.win_buf)
+            .is_some();
+        if !have {
             if self.args.debug {
                 eprintln!(
-                    "[rx_tcp][dbg] acq skipped: ring.get_vec failed (n_start={}, win_len={})",
+                    "[rx_tcp][dbg] acq skipped: ring window unavailable (n_start={}, win_len={})",
                     n_start, win_len
                 );
             }
             self.state.acq.search_cursor_ti = Some(next_ti + 1);
             return Ok(());
-        };
+        }
+        let y_win = &self.signal.win_buf;
 
         if self.args.debug {
             eprintln!(
@@ -482,7 +521,7 @@ impl Receiver {
         let backlog_before_s = (ti_latest.saturating_sub(next_ti) as f64) * self.p.iv_res_s;
         let t_acq0 = Instant::now();
         match self.modem.acquire_fft_raw_window(
-            &y_win,
+            y_win,
             next_ti,
             n_ti,
             self.args.p_fa_total,
@@ -547,7 +586,7 @@ impl Receiver {
                             .signal
                             .pending
                             .iter()
-                            .min_by(|a, b| a.1.p_max.partial_cmp(&b.1.p_max).unwrap())
+                            .min_by(|a, b| a.1.p_max.total_cmp(&b.1.p_max))
                         {
                             self.signal.pending.remove(&worst_ti);
                         }

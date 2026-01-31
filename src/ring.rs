@@ -44,7 +44,8 @@ impl<T: Copy + Default> Ring<T> {
         }
     }
 
-    pub fn get_vec(&self, start_abs: u64, len: usize) -> Option<Vec<T>> {
+    /// Copy a contiguous window `[start_abs, start_abs + len)` into `out`, reusing its allocation.
+    pub fn copy_into(&self, start_abs: u64, len: usize, out: &mut Vec<T>) -> Option<()> {
         let len_u = len as u64;
         if start_abs < self.abs_base {
             return None;
@@ -52,11 +53,49 @@ impl<T: Copy + Default> Ring<T> {
         if start_abs + len_u > self.abs_next {
             return None;
         }
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len_u {
-            let idx = ((start_abs + i) % self.cap) as usize;
-            out.push(self.buf[idx]);
+
+        out.clear();
+        if out.capacity() < len {
+            out.reserve(len - out.capacity());
         }
+
+        let cap = self.cap as usize;
+        let start = (start_abs % self.cap) as usize;
+        let first = std::cmp::min(len, cap - start);
+        out.extend_from_slice(&self.buf[start..start + first]);
+        if first < len {
+            out.extend_from_slice(&self.buf[..(len - first)]);
+        }
+        Some(())
+    }
+
+    /// Get up to two slices that represent the requested logical window without copying.
+    ///
+    /// When the window does not wrap, the second slice is empty.
+    pub fn get_slices(&self, start_abs: u64, len: usize) -> Option<(&[T], &[T])> {
+        let len_u = len as u64;
+        if start_abs < self.abs_base {
+            return None;
+        }
+        if start_abs + len_u > self.abs_next {
+            return None;
+        }
+
+        let cap = self.cap as usize;
+        let start = (start_abs % self.cap) as usize;
+        let first = std::cmp::min(len, cap - start);
+        let a = &self.buf[start..start + first];
+        let b = if first < len {
+            &self.buf[..(len - first)]
+        } else {
+            &self.buf[..0]
+        };
+        Some((a, b))
+    }
+
+    pub fn get_vec(&self, start_abs: u64, len: usize) -> Option<Vec<T>> {
+        let mut out = Vec::with_capacity(len);
+        self.copy_into(start_abs, len, &mut out)?;
         Some(out)
     }
 }

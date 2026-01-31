@@ -116,7 +116,9 @@ pub fn parse_u_bits(u_bits: &[u8]) -> anyhow::Result<(Header, Vec<u8>, bool)> {
         return Ok((hdr, Vec::new(), false));
     }
     let payload = bytes[2..end_payload].to_vec();
-    let crc_rx = u32::from_be_bytes(bytes[end_payload..end_crc].try_into().unwrap());
+    let mut crc_b = [0u8; 4];
+    crc_b.copy_from_slice(&bytes[end_payload..end_crc]);
+    let crc_rx = u32::from_be_bytes(crc_b);
     let crc_ok = crc32c(&bytes[..end_payload]) == crc_rx;
     Ok((hdr, payload, crc_ok))
 }

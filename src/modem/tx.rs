@@ -5,6 +5,7 @@ use crate::frame::build_u_bits;
 use crate::interleaver::interleave_frame_bits;
 use crate::polar::polar_encode_u256;
 use crate::walsh::walsh_row;
+use anyhow::Context;
 use num_complex::Complex32;
 
 impl ScBltcModem {
@@ -26,12 +27,13 @@ impl ScBltcModem {
         let m = bits_to_symbols(&b_bits, p.k_bits_per_sym);
         assert_eq!(m.len(), p.n_data);
 
-        let t = t_tx.unwrap_or_else(|| {
-            std::time::SystemTime::now()
+        let t = match t_tx {
+            Some(t) => t,
+            None => std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-        });
+                .context("system clock is before UNIX_EPOCH")?
+                .as_secs_f64(),
+        };
         let ti_tx = (t / p.iv_res_s).floor() as u64;
 
         let c_seq = gen_code_aes_ctr(&self.key, ti_tx, p.frame_chips(), p.domain_u32);
