@@ -13,7 +13,7 @@ use crate::crypto::gen_code_aes_ctr;
 use crate::frame::build_u_bits;
 use crate::interleaver::interleave_frame_bits;
 use crate::polar::polar_encode_u256;
-use crate::walsh::walsh_row;
+use crate::walsh::walsh_sign;
 use anyhow::Context;
 use num_complex::Complex32;
 
@@ -66,9 +66,10 @@ impl ScBltcModem {
             } else if is_pilot(ell) {
                 s[seg0..seg0 + p.sf()].copy_from_slice(&c_seq[seg0..seg0 + p.sf()]);
             } else {
-                let row = walsh_row(m[q] as u16, p.sf())?;
+                let m_q = m[q] as u16;
                 for j in 0..p.sf() {
-                    s[seg0 + j] = row[j] * c_seq[seg0 + j];
+                    let w = walsh_sign(m_q, j);
+                    s[seg0 + j] = w * c_seq[seg0 + j];
                 }
                 q += 1;
             }

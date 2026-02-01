@@ -13,6 +13,21 @@
 use anyhow::bail;
 use num_complex::Complex32;
 
+/// Return the `j`-th element of the `m`-th Walsh/Hadamard row (`+1` or `-1`).
+///
+/// This is the Sylvester-Hadamard ordering used throughout the modem:
+/// `W_m[j] = (-1)^(popcount(m & j) mod 2)`.
+#[inline]
+pub fn walsh_sign(m: u16, j: usize) -> i8 {
+    let v = (m as u32) & (j as u32);
+    let parity = v.count_ones() & 1;
+    if parity == 0 {
+        1
+    } else {
+        -1
+    }
+}
+
 /// Generate the `m`-th Walsh/Hadamard row of length `n` (entries are `+1` or `-1`).
 ///
 /// For orthogonality, `n` must be a power of two; the protocol uses `n=1024`.
@@ -25,9 +40,7 @@ pub fn walsh_row(m: u16, n: usize) -> anyhow::Result<Vec<i8>> {
     }
     let mut out = vec![0i8; n];
     for (j, out_j) in out.iter_mut().enumerate() {
-        let v = (m as u32) & (j as u32);
-        let parity = v.count_ones() & 1;
-        *out_j = if parity == 0 { 1 } else { -1 };
+        *out_j = walsh_sign(m, j);
     }
     Ok(out)
 }

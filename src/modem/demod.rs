@@ -28,7 +28,7 @@ use crate::frame::parse_u_bits;
 use crate::interleaver::deinterleave_frame_llr;
 use crate::polar::polar_decode_to_u256_from_llr;
 use crate::tracking::{design_2nd_order_loop, EarlyLateDll};
-use crate::walsh::{fht1024_in_place, walsh_row};
+use crate::walsh::{fht1024_in_place, walsh_sign};
 use num_complex::Complex32;
 use std::cmp::Ordering;
 
@@ -393,7 +393,7 @@ impl<'a> SymbolTracker<'a> {
     fn process_symbol(
         &mut self,
         ell: usize,
-        r_data_all: &mut Vec<Vec<Complex32>>,
+        llr_out: &mut [f64],
         q_data: &mut usize,
     ) -> anyhow::Result<()> {
         let p = self.p;
@@ -417,7 +417,7 @@ impl<'a> SymbolTracker<'a> {
         let outcome = if ell < p.n_pre() || is_pilot(ell) {
             self.process_pilot_symbol(ell)
         } else {
-            self.process_data_symbol(r_data_all, q_data)?
+            self.process_data_symbol(llr_out, q_data)?
         };
 
         self.apply_freq_snap(outcome.freq_conf, outcome.best_dhz);
@@ -530,7 +530,7 @@ impl<'a> SymbolTracker<'a> {
 
     fn process_data_symbol(
         &mut self,
-        r_data_all: &mut Vec<Vec<Complex32>>,
+        llr_out: &mut [f64],
         q_data: &mut usize,
     ) -> anyhow::Result<SymbolProcOutcome> {
         let p = self.p;
@@ -579,11 +579,25 @@ impl<'a> SymbolTracker<'a> {
         let freq_conf = (best_v - second) / (best_v.abs() + 1e-18);
         // Gate PLL/DD only on code confidence; freq_conf can be flat even when code is OK.
         let data_conf = best_code_conf;
-
-        let r256 = self.buffers.r_best[..p.mw()].to_vec();
-        r_data_all.push(r256);
+        let q = *q_data;
+        if q >= p.n_data() {
+            anyhow::bail!(
+                "internal mapping error: data symbol index out of range (q_data={q}, n_data={})",
+                p.n_data()
+            );
+        }
+        let k = p.k_bits_per_sym();
+        let llr_base = q * k;
+        if llr_out.len() < llr_base + k {
+            anyhow::bail!(
+                "internal error: llr_out too small (len={}, need={})",
+                llr_out.len(),
+                llr_base + k
+            );
+        }
 
         Self::pll_predict(&mut self.theta, omega_used);
+        let mut rot_llr: Option<Complex32> = None;
         let dll_update = if data_conf.is_finite() && data_conf > 0.10 {
             let mut z_dd = self.buffers.r_best[best_i];
             if z_dd.re < 0.0 {
@@ -602,15 +616,10 @@ impl<'a> SymbolTracker<'a> {
                 );
             }
 
-            // Decision-directed per-symbol phase alignment for soft-demapping (LLRs).
             let den = z_dd.norm();
             if den > 1e-6 {
-                let rot = z_dd.conj() / den;
-                if let Some(last) = r_data_all.last_mut() {
-                    for v in last.iter_mut() {
-                        *v *= rot;
-                    }
-                }
+                // Decision-directed per-symbol phase alignment for soft-demapping (LLRs).
+                rot_llr = Some(z_dd.conj() / den);
             }
 
             Some(DllUpdate {
@@ -620,6 +629,34 @@ impl<'a> SymbolTracker<'a> {
         } else {
             None
         };
+
+        if k > 8 {
+            anyhow::bail!("k_bits_per_sym too large (k={k})");
+        }
+        let mut m0 = [f32::NEG_INFINITY; 8];
+        let mut m1 = [f32::NEG_INFINITY; 8];
+        for m in 0..mw {
+            let v = self.buffers.r_best[m];
+            let v_re = match rot_llr {
+                Some(rot) => (v * rot).re,
+                None => v.re,
+            };
+            let m_u16 = m as u16;
+            for t in 0..k {
+                let bit = (m_u16 >> (k - 1 - t)) & 1;
+                if bit == 0 {
+                    if v_re > m0[t] {
+                        m0[t] = v_re;
+                    }
+                } else if v_re > m1[t] {
+                    m1[t] = v_re;
+                }
+            }
+        }
+        for t in 0..k {
+            llr_out[llr_base + t] = (m0[t] - m1[t]) as f64;
+        }
+
         *q_data += 1;
 
         Ok(SymbolProcOutcome {
@@ -693,11 +730,11 @@ impl<'a> SymbolTracker<'a> {
                 self.buffers.u_l.iter().copied().sum::<Complex32>(),
             )
         } else {
-            let wrow = walsh_row(update.m as u16, p.sf())?;
             let mut se = Complex32::new(0.0, 0.0);
             let mut sl = Complex32::new(0.0, 0.0);
-            for (j, &w) in wrow.iter().enumerate().take(p.sf()) {
-                let wf = w as f32;
+            let m = update.m as u16;
+            for j in 0..p.sf() {
+                let wf = walsh_sign(m, j) as f32;
                 se += self.buffers.u_e[j] * wf;
                 sl += self.buffers.u_l[j] * wf;
             }
@@ -794,38 +831,17 @@ impl ScBltcModem {
             cascade_delay,
         )?;
 
-        let mut r_data_all: Vec<Vec<Complex32>> = Vec::with_capacity(p.n_data());
+        // Spec §4.D.2–§4.D.3: fill LLRs incrementally while processing each data symbol.
+        let mut llr = [0f64; 512];
         let mut q_data = 0usize;
         for ell in 0..p.n_sym() {
-            tracker.process_symbol(ell, &mut r_data_all, &mut q_data)?;
+            tracker.process_symbol(ell, &mut llr, &mut q_data)?;
         }
 
-        if q_data != p.n_data() || r_data_all.len() != p.n_data() {
+        if q_data != p.n_data() {
             return Ok((None, DecodeMeta::error("data_symbol_count_mismatch")));
         }
 
-        // Spec §4.D.2–§4.D.3.
-        let mut llr = [0f64; 512];
-        for q in 0..p.n_data() {
-            let d = &r_data_all[q];
-            for t in 0..p.k_bits_per_sym() {
-                let mut m0 = f32::NEG_INFINITY;
-                let mut m1 = f32::NEG_INFINITY;
-                let shift = (p.k_bits_per_sym() - 1 - t) as u16;
-                for (m, v) in d.iter().enumerate().take(p.mw()) {
-                    let bit = ((m as u16) >> shift) & 1;
-                    let v = v.re;
-                    if bit == 0 {
-                        if v > m0 {
-                            m0 = v;
-                        }
-                    } else if v > m1 {
-                        m1 = v;
-                    }
-                }
-                llr[q * p.k_bits_per_sym() + t] = (m0 - m1) as f64;
-            }
-        }
         for v in &mut llr {
             *v = v.clamp(-1e6, 1e6);
         }

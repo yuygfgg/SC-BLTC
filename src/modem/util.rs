@@ -65,8 +65,15 @@ pub(super) fn derotate_cfo_in_place(x: &mut [Complex32], fs_hz: u32, cfo_hz: f64
         return;
     }
     let fs = fs_hz as f32;
+    let phase_step = -2.0 * std::f32::consts::PI * (cfo_hz as f32) / fs;
+    let w = Complex32::from_polar(1.0, phase_step);
+    let mut ph = Complex32::new(1.0, 0.0);
     for (n, v) in x.iter_mut().enumerate() {
-        let ph = -2.0 * std::f32::consts::PI * (cfo_hz as f32) * (n as f32) / fs;
-        *v *= Complex32::from_polar(1.0, ph);
+        *v *= ph;
+        ph *= w;
+        // Keep `ph` on the unit circle to avoid long-run magnitude drift.
+        if (n & 4095) == 4095 {
+            ph /= ph.norm();
+        }
     }
 }
