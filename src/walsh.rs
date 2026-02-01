@@ -94,15 +94,15 @@ mod tests {
     #[test]
     fn fht_matches_direct_for_small_prefix() {
         let mut x = vec![Complex32::new(0.0, 0.0); 1024];
-        for i in 0..8 {
-            x[i] = Complex32::new((i + 1) as f32, 0.0);
+        for (i, x_i) in x.iter_mut().take(8).enumerate() {
+            *x_i = Complex32::new((i + 1) as f32, 0.0);
         }
         let y = fht1024(&x).unwrap();
         for m in 0..8u16 {
             let w = walsh_row(m, 8).unwrap();
             let mut s = 0.0f32;
-            for j in 0..8 {
-                s += (x[j].re) * (w[j] as f32);
+            for (&x_j, &w_j) in x.iter().take(8).zip(w.iter()) {
+                s += x_j.re * (w_j as f32);
             }
             assert!((y[m as usize].re - s).abs() < 1e-4);
         }

@@ -19,7 +19,10 @@ fn end_to_end_ideal_frame() -> anyhow::Result<()> {
     let frame = modem.build_frame_samples(b"hello", 1, 1, Some(1000.0))?;
 
     let mut rx = frame.samples.clone();
-    rx.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 16));
+    rx.extend(std::iter::repeat_n(
+        Complex32::new(0.0, 0.0),
+        2 * modem.rrc.delay() + 16,
+    ));
 
     let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, 0, &[0], 0.0, 8)?;
     assert!(meta.crc_ok, "meta={meta:?}");
@@ -30,7 +33,7 @@ fn end_to_end_ideal_frame() -> anyhow::Result<()> {
 #[test]
 fn end_to_end_with_known_cfo() -> anyhow::Result<()> {
     let p = Params::default();
-    let modem = ScBltcModem::new(p.clone(), [0u8; 32])?;
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
 
     let frame = modem.build_frame_samples(b"cfo", 1, 1, Some(2000.0))?;
 
@@ -45,7 +48,10 @@ fn end_to_end_with_known_cfo() -> anyhow::Result<()> {
             x * Complex32::from_polar(1.0, ph)
         })
         .collect();
-    rx.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 16));
+    rx.extend(std::iter::repeat_n(
+        Complex32::new(0.0, 0.0),
+        2 * modem.rrc.delay() + 16,
+    ));
 
     let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, 0, &[0], cfo_hz, 8)?;
     assert!(meta.crc_ok, "meta={meta:?}");
@@ -57,7 +63,7 @@ fn end_to_end_with_known_cfo() -> anyhow::Result<()> {
 fn acquisition_fft_then_decode() -> anyhow::Result<()> {
     // Spec §4.B.1 (epoch-internal offset).
     let p = Params::default();
-    let modem = ScBltcModem::new(p.clone(), [0u8; 32])?;
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
 
     let t_tx = 4000.0f64 + 0.00037;
     let frame = modem.build_frame_samples(b"acq", 1, 1, Some(t_tx))?;
@@ -111,7 +117,7 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
 fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
     // Spec §4.B.1 (CFO search band).
     let p = Params::default();
-    let modem = ScBltcModem::new(p.clone(), [0u8; 32])?;
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
 
     let t_tx = 5000.0f64 + 0.00037;
     let frame = modem.build_frame_samples(b"acq2", 1, 1, Some(t_tx))?;
@@ -164,7 +170,7 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
 #[test]
 fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
     let p = Params::default();
-    let modem = ScBltcModem::new(p.clone(), [0u8; 32])?;
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
 
     let path1_amp: f32 = 1.0;
     let path1_doppler_hz: f64 = 0.0;
@@ -193,7 +199,10 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
 
     let mut signal = vec![Complex32::new(0.0, 0.0); pre];
     signal.extend_from_slice(&frame.samples);
-    signal.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 256));
+    signal.extend(std::iter::repeat_n(
+        Complex32::new(0.0, 0.0),
+        2 * modem.rrc.delay() + 256,
+    ));
 
     let n_samples = signal.len();
     let mut raw = vec![Complex32::new(0.0, 0.0); n_samples];
@@ -255,7 +264,7 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
 #[test]
 fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
     let p = Params::default();
-    let modem = ScBltcModem::new(p.clone(), [0u8; 32])?;
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
 
     let path1_amp: f32 = 1.0;
     let path2_amp: f32 = 0.9;
@@ -280,7 +289,10 @@ fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
 
     let mut signal = vec![Complex32::new(0.0, 0.0); pre];
     signal.extend_from_slice(&frame.samples);
-    signal.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(2 * modem.rrc.delay() + 512));
+    signal.extend(std::iter::repeat_n(
+        Complex32::new(0.0, 0.0),
+        2 * modem.rrc.delay() + 512,
+    ));
 
     let n_samples = signal.len();
     let mut raw = vec![Complex32::new(0.0, 0.0); n_samples];

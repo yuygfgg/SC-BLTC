@@ -304,13 +304,13 @@ mod tests {
     #[test]
     fn encode_then_decode_high_confidence() {
         let mut u = [0u8; POLAR_K];
-        for i in 0..POLAR_K {
-            u[i] = ((i * 7 + 3) & 1) as u8;
+        for (i, u_i) in u.iter_mut().enumerate() {
+            *u_i = ((i * 7 + 3) & 1) as u8;
         }
         let b = polar_encode_u256(&u);
         let mut llr = [0f64; POLAR_N];
-        for i in 0..POLAR_N {
-            llr[i] = if b[i] == 0 { 20.0 } else { -20.0 };
+        for (llr_i, &b_i) in llr.iter_mut().zip(b.iter()) {
+            *llr_i = if b_i == 0 { 20.0 } else { -20.0 };
         }
         let u_hat = polar_decode_to_u256_from_llr(&llr, 8);
         assert_eq!(u_hat, u);
@@ -324,8 +324,8 @@ mod tests {
 
         let b = polar_encode_u256(&u);
         let mut llr = [0f64; POLAR_N];
-        for i in 0..POLAR_N {
-            llr[i] = if b[i] == 0 { 6.0 } else { -6.0 };
+        for (llr_i, &b_i) in llr.iter_mut().zip(b.iter()) {
+            *llr_i = if b_i == 0 { 6.0 } else { -6.0 };
         }
         let u_hat = polar_decode_to_u256_from_llr(&llr, 8);
         let (_hdr, _payload, ok) = crate::frame::parse_u_bits(&u_hat)?;

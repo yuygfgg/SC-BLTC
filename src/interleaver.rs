@@ -53,19 +53,19 @@ mod tests {
     #[test]
     fn interleaver_is_bijective() {
         let mut bits = [0u8; FRAME_BITS];
-        for i in 0..FRAME_BITS {
-            bits[i] = (i & 1) as u8;
+        for (i, b) in bits.iter_mut().enumerate() {
+            *b = (i & 1) as u8;
         }
         let int = interleave_frame_bits(&bits);
 
         let mut llr_int = [0f64; FRAME_BITS];
-        for i in 0..FRAME_BITS {
-            llr_int[i] = if int[i] == 0 { 1.0 } else { -1.0 };
+        for (llr, &b) in llr_int.iter_mut().zip(int.iter()) {
+            *llr = if b == 0 { 1.0 } else { -1.0 };
         }
         let llr = deinterleave_frame_llr(&llr_int);
-        for i in 0..FRAME_BITS {
-            let b = if llr[i] < 0.0 { 1 } else { 0 };
-            assert_eq!(b, bits[i] as i32);
+        for (&llr_i, &b_i) in llr.iter().zip(bits.iter()) {
+            let b = if llr_i < 0.0 { 1 } else { 0 };
+            assert_eq!(b, b_i as i32);
         }
     }
 }

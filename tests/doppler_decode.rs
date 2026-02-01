@@ -57,7 +57,7 @@ fn apply_ou_doppler_and_awgn(
 fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key)?;
+    let modem = ScBltcModem::new(p, key)?;
 
     // Make t_tx land at n0=4 samples into the IV epoch (like the CLI example).
     let fs = p.fs_hz() as f64;
@@ -119,7 +119,7 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
 fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key)?;
+    let modem = ScBltcModem::new(p, key)?;
 
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
@@ -160,7 +160,7 @@ fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
 fn test_decode_awgn_only() -> anyhow::Result<()> {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key)?;
+    let modem = ScBltcModem::new(p, key)?;
 
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
@@ -201,7 +201,7 @@ fn test_decode_awgn_only() -> anyhow::Result<()> {
 fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key)?;
+    let modem = ScBltcModem::new(p, key)?;
 
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
@@ -245,7 +245,7 @@ fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
 fn test_decode_with_constant_cfo_without_derotation() -> anyhow::Result<()> {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key)?;
+    let modem = ScBltcModem::new(p, key)?;
 
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;

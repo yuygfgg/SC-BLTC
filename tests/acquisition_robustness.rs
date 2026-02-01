@@ -9,7 +9,7 @@ use sc_bltc::params::Params;
 fn test_acquire_on_noise() {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key).unwrap();
+    let modem = ScBltcModem::new(p, key).unwrap();
 
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
@@ -41,7 +41,7 @@ fn test_acquire_on_noise() {
 fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let p = Params::default();
     let key = [0u8; 32];
-    let modem = ScBltcModem::new(p.clone(), key)?;
+    let modem = ScBltcModem::new(p, key)?;
 
     let noise_std: f32 = 2.0;
     let cfo_hz: f64 = 50.0;
