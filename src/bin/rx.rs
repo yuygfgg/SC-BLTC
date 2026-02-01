@@ -144,15 +144,11 @@ impl Receiver {
 
         let fs = p.fs_hz() as f64;
         let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as u64;
-        let l_sym = p.chip_samples() as u64;
-        let ell_last_pilot = 2u64 + 5u64 * (p.n_pilot().saturating_sub(1) as u64);
-        let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-        let pilot_timing_win: u64 = 32;
         let rake_search_half_samples: u64 = ((p.fs_hz() as f64) * p.rake_search_half_s())
             .round()
             .max(0.0) as u64;
-        let acq_guard_samples =
-            last_pilot_end + pilot_timing_win + iv_samples + rake_search_half_samples;
+        let frame_max = p.frame_max_samples_with_jitter() as u64;
+        let acq_guard_samples = rake_search_half_samples + frame_max + 64;
         let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
 
         let cap_samples = (args.buffer_sec.max(1.0) * fs).round() as usize;
@@ -529,7 +525,7 @@ impl Receiver {
                     let max_off = acq.finger_offsets.iter().copied().max().unwrap_or(acq.n0) as u64;
                     let decode_need_abs = base_abs
                         + max_off
-                        + (self.p.frame_samples_with_tail() as u64)
+                        + (self.p.frame_max_samples_with_jitter() as u64)
                         + (4 * self.modem.rrc.delay() as u64)
                         + 256;
                     let decode_in_s = (decode_need_abs.saturating_sub(self.signal.ring.abs_next())

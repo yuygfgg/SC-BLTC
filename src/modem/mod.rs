@@ -4,7 +4,7 @@
 //!
 //! Public entry points:
 //! - TX: [`ScBltcModem::build_frame_samples`]
-//! - RX acquisition: [`ScBltcModem::acquire_fft_raw_window`], [`ScBltcModem::acquire_fft_matched_window`]
+//! - RX acquisition: [`ScBltcModem::acquire_fft_raw_window`]
 //! - RX demod/decoding: [`ScBltcModem::demod_decode_raw`], [`ScBltcModem::demod_decode_matched`]
 //!
 //! The heavy lifting lives in submodules:

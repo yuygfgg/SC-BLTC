@@ -85,17 +85,20 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
         x * Complex32::from_polar(1.0, ph)
     }));
 
-    let y = modem.rrc.filter_same(&raw);
     let n_ti = 5usize;
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
     let rake_search_half = ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
-    let y_win = &y[..win_need];
+    let frame_max = p.frame_max_samples_with_jitter();
+    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    if raw.len() < win_need {
+        raw.extend(std::iter::repeat_n(
+            Complex32::new(0.0, 0.0),
+            win_need - raw.len(),
+        ));
+    }
+    let x_win = &raw[..win_need];
 
     let acq = modem
-        .acquire_fft_matched_window(y_win, ti_min, n_ti, 3)?
+        .acquire_fft_raw_window(x_win, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx);
     assert_eq!(acq.n0, n0);
@@ -140,11 +143,15 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
     }));
 
     let n_ti = 5usize;
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
     let rake_search_half = ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+    let frame_max = p.frame_max_samples_with_jitter();
+    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    if raw.len() < win_need {
+        raw.extend(std::iter::repeat_n(
+            Complex32::new(0.0, 0.0),
+            win_need - raw.len(),
+        ));
+    }
     let x_win = &raw[..win_need];
 
     let acq = modem
@@ -235,11 +242,15 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
     }
 
     let n_ti = 5usize;
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
     let rake_search_half = ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+    let frame_max = p.frame_max_samples_with_jitter();
+    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    if raw.len() < win_need {
+        raw.extend(std::iter::repeat_n(
+            Complex32::new(0.0, 0.0),
+            win_need - raw.len(),
+        ));
+    }
     let x_win = &raw[..win_need];
 
     let acq = modem
@@ -313,11 +324,15 @@ fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
     }
 
     let n_ti = 5usize;
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+    let frame_max = p.frame_max_samples_with_jitter();
+    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    if raw.len() < win_need {
+        raw.extend(std::iter::repeat_n(
+            Complex32::new(0.0, 0.0),
+            win_need - raw.len(),
+        ));
+    }
     let x_win = &raw[..win_need];
 
     let acq = modem

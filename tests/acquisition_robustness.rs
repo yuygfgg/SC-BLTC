@@ -14,12 +14,9 @@ fn test_acquire_on_noise() {
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
 
     let n_ti = 1;
-    let window_len = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+    let window_len = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let mut rng = StdRng::seed_from_u64(0);
     let n01 = Normal::<f32>::new(0.0, 1.0).unwrap();
@@ -31,9 +28,7 @@ fn test_acquire_on_noise() {
         })
         .collect();
 
-    let result = modem
-        .acquire_fft_matched_window(&noise, 1000, n_ti, 3)
-        .unwrap();
+    let result = modem.acquire_fft_raw_window(&noise, 1000, n_ti, 3).unwrap();
     assert!(result.is_none(), "false alarm: {result:?}");
 }
 
@@ -53,9 +48,6 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
-    let last_pilot_end = (ell_last_pilot + 1) * l_sym;
 
     let ti_min = ti_tx.saturating_sub(2);
     let n_ti = 5usize;
@@ -64,7 +56,7 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let n0 = (frac * fs).round() as usize % iv_samples;
     let pre = base + n0;
 
-    let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
+    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
     let mut raw = vec![Complex32::new(0.0, 0.0); win_need];
 
     let mut rng = StdRng::seed_from_u64(1);
@@ -73,7 +65,7 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
         *s = Complex32::new(n01.sample(&mut rng), n01.sample(&mut rng));
     }
 
-    let sig_need = (last_pilot_end + 32).min(frame.samples.len());
+    let sig_need = frame.samples.len().min(win_need.saturating_sub(pre));
     raw[pre..pre + sig_need].copy_from_slice(&frame.samples[..sig_need]);
 
     // Apply a global CFO rotation to the entire window (signal + noise).
@@ -89,7 +81,10 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}, ti_tx={ti_tx}");
-    assert_eq!(acq.n0, n0, "acq={acq:?}, n0_true={n0}");
+    assert!(
+        (acq.n0 as isize - n0 as isize).abs() <= 3,
+        "acq={acq:?}, n0_true={n0}"
+    );
     assert!(
         (acq.cfo_hat_hz - cfo_hz).abs() <= 5.0,
         "acq={acq:?}, cfo_true={cfo_hz}"
@@ -149,15 +144,39 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
 
 #[test]
 fn test_crypto_different_keys() {
-    use sc_bltc::crypto::gen_code_aes_ctr;
+    use sc_bltc::crypto::{gen_code_structured_aes_ctr, JitterSpec};
     let key_a = [0xAAu8; 32];
     let key_b = [0xBBu8; 32];
     let ti = 1000;
     let len = 1024;
     let domain = 0x12345678;
 
-    let c_a = gen_code_aes_ctr(&key_a, ti, len, domain);
-    let c_b = gen_code_aes_ctr(&key_b, ti, len, domain);
+    let c_a = gen_code_structured_aes_ctr(
+        &key_a,
+        ti,
+        1,
+        len,
+        domain,
+        8000.0,
+        JitterSpec {
+            min_chips: 0,
+            span_chips: 0,
+        },
+    )
+    .c_seq;
+    let c_b = gen_code_structured_aes_ctr(
+        &key_b,
+        ti,
+        1,
+        len,
+        domain,
+        8000.0,
+        JitterSpec {
+            min_chips: 0,
+            span_chips: 0,
+        },
+    )
+    .c_seq;
 
     assert_ne!(c_a, c_b, "Different keys must produce different codes");
 

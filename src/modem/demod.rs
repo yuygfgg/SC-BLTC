@@ -21,9 +21,11 @@
 //!   -> polar decode -> parse Header/Payload/CRC
 //! ```
 
-use super::util::{derotate_cfo_in_place, is_pilot, wrap_pm_pi};
+use super::util::{
+    apply_hop_with_start_in_place, derotate_cfo_in_place, is_pilot, wrap_pm_pi, HopParams,
+};
 use super::{DecodeMeta, ScBltcModem};
-use crate::crypto::gen_code_aes_ctr;
+use crate::crypto::{gen_code_structured_aes_ctr, JitterSpec};
 use crate::frame::parse_u_bits;
 use crate::interleaver::deinterleave_frame_llr;
 use crate::polar::polar_decode_to_u256_from_llr;
@@ -82,6 +84,7 @@ struct SymbolTracker<'a> {
     p: &'a crate::params::Params,
     y: &'a [Complex32],
     c_seq: &'a [i8],
+    j_seq: &'a [usize],
     n_finger: usize,
     t_sym0: Vec<f64>,
     dll: EarlyLateDll,
@@ -90,7 +93,7 @@ struct SymbolTracker<'a> {
     omega_lim: f64,
     pll_kp: f64,
     pll_ki: f64,
-    tsym: f64,
+    t_data: f64,
     g: Vec<Complex32>,
     w_mrc: Vec<Complex32>,
     pre_mag_ref: f32,
@@ -106,38 +109,63 @@ struct SymbolTracker<'a> {
     buffers: SymbolBuffers,
 }
 
+struct TrackerTiming<'a> {
+    n_offset_total: &'a [usize],
+    frame_start: f64,
+    cascade_delay: usize,
+}
+
+struct FingerInit<'a> {
+    n_finger: usize,
+    t_sym0: &'a [f64],
+    j0_chips: usize,
+    chip_step0: f64,
+    sym_step_nom: f64,
+}
+
 impl<'a> SymbolTracker<'a> {
     fn new(
         p: &'a crate::params::Params,
         y: &'a [Complex32],
         c_seq: &'a [i8],
+        j_seq: &'a [usize],
         n_finger: usize,
-        n_offset_total: &[usize],
-        frame_start: f64,
-        cascade_delay: usize,
+        timing: TrackerTiming<'a>,
     ) -> anyhow::Result<Self> {
-        let t_sym0 = Self::init_symbol_times(n_offset_total, n_finger, frame_start, cascade_delay);
-        let tsym = (p.sf() as f64) / (p.rc_chip_sps() as f64);
-        let dll = Self::init_dll(p, tsym);
+        let t_sym0 = Self::init_symbol_times(
+            timing.n_offset_total,
+            n_finger,
+            timing.frame_start,
+            timing.cascade_delay,
+        );
+        // Data segment duration (fixed, does not include guard/noise).
+        let t_data = (p.sf() as f64) / (p.rc_chip_sps() as f64);
+        // Symbol update period (includes guard/noise) used for loop-gain design.
+        let j_avg = (p.jitter_min_chips() as f64) + 0.5 * (p.jitter_span_chips() as f64);
+        let t_update = ((p.sf() as f64) + j_avg) / (p.rc_chip_sps() as f64);
+        let dll = Self::init_dll(p, t_update);
         let chip_step0 = dll.sym_step_samp / (p.sf() as f64);
 
         let (u0_fingers, u1_fingers) = Self::sample_initial_fingers(
             y,
             c_seq,
             p,
-            n_finger,
-            &t_sym0,
-            chip_step0,
-            dll.sym_step_samp,
+            FingerInit {
+                n_finger,
+                t_sym0: &t_sym0,
+                j0_chips: j_seq.first().copied().unwrap_or(0),
+                chip_step0,
+                sym_step_nom: dll.sym_step_samp,
+            },
         )?;
         let pre_corr = Self::pre_corr(&u0_fingers, &u1_fingers);
         let (theta, g) = Self::init_phase_and_channel(&pre_corr, p.n_pre(), p.sf(), n_finger);
         let w_mrc = Self::mrc_weights(&g);
 
-        let (pll_kp, pll_ki, omega_lim) = Self::init_pll(tsym);
+        let (pll_kp, pll_ki, omega_lim) = Self::init_pll(t_update, t_data);
         let omega = 0.0f64;
 
-        let (bank_dhz, bank_domega, bank_step_hz) = Self::init_freq_bank(tsym);
+        let (bank_dhz, bank_domega, bank_step_hz) = Self::init_freq_bank(t_data);
         let pre_mag_ref = Self::preamble_mag_ref(p, n_finger, &u0_fingers, &w_mrc, theta);
         let alpha_ch = 1.0 / (p.n_pilot() as f64);
 
@@ -145,6 +173,7 @@ impl<'a> SymbolTracker<'a> {
             p,
             y,
             c_seq,
+            j_seq,
             n_finger,
             t_sym0,
             dll,
@@ -153,7 +182,7 @@ impl<'a> SymbolTracker<'a> {
             omega_lim,
             pll_kp,
             pll_ki,
-            tsym,
+            t_data,
             g,
             w_mrc,
             pre_mag_ref,
@@ -208,23 +237,28 @@ impl<'a> SymbolTracker<'a> {
         y: &[Complex32],
         c_seq: &[i8],
         p: &crate::params::Params,
-        n_finger: usize,
-        t_sym0: &[f64],
-        chip_step0: f64,
-        sym_step_nom: f64,
+        init: FingerInit<'_>,
     ) -> anyhow::Result<(FingerSamples, FingerSamples)> {
-        let mut u0_fingers: FingerSamples = Vec::with_capacity(n_finger);
-        let mut u1_fingers: FingerSamples = Vec::with_capacity(n_finger);
-        for &t0 in t_sym0.iter().take(n_finger) {
+        let mut u0_fingers: FingerSamples = Vec::with_capacity(init.n_finger);
+        let mut u1_fingers: FingerSamples = Vec::with_capacity(init.n_finger);
+        let gi0_samp = (init.j0_chips as f64) * init.chip_step0;
+        for &t0 in init.t_sym0.iter().take(init.n_finger) {
             let mut y0 = vec![Complex32::new(0.0, 0.0); p.sf()];
-            Self::sample_symbol_into(y, t0, chip_step0, 0.0, &mut y0)
+            Self::sample_symbol_into(y, t0, init.chip_step0, 0.0, &mut y0)
                 .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
             Self::demask_in_place(c_seq, p.sf(), 0, &mut y0);
             u0_fingers.push(y0);
 
             let mut y1 = vec![Complex32::new(0.0, 0.0); p.sf()];
-            Self::sample_symbol_into(y, t0 + sym_step_nom, chip_step0, 0.0, &mut y1)
-                .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
+            // Symbol 1 starts after the symbol-0 data segment plus its guard/noise span.
+            Self::sample_symbol_into(
+                y,
+                t0 + init.sym_step_nom + gi0_samp,
+                init.chip_step0,
+                0.0,
+                &mut y1,
+            )
+            .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
             Self::demask_in_place(c_seq, p.sf(), 1, &mut y1);
             u1_fingers.push(y1);
         }
@@ -275,15 +309,16 @@ impl<'a> SymbolTracker<'a> {
         (theta, g)
     }
 
-    fn init_pll(tsym: f64) -> (f64, f64, f64) {
+    fn init_pll(t_update: f64, t_data: f64) -> (f64, f64, f64) {
         let pll_bw_hz = 1.0;
         let zeta = 0.707;
-        let pll_g = design_2nd_order_loop(pll_bw_hz, zeta, tsym);
-        let omega_lim = 2.0 * std::f64::consts::PI * 200.0 * tsym;
+        let pll_g = design_2nd_order_loop(pll_bw_hz, zeta, t_update);
+        // `omega` is stored as the phase advance across the data segment.
+        let omega_lim = 2.0 * std::f64::consts::PI * 200.0 * t_data;
         (pll_g.kp, pll_g.ki, omega_lim)
     }
 
-    fn init_freq_bank(tsym: f64) -> (Vec<f64>, Vec<f64>, f64) {
+    fn init_freq_bank(t_data: f64) -> (Vec<f64>, Vec<f64>, f64) {
         let bank_half_hz = 4.0f64;
         let bank_step_hz = 0.25f64;
         let bank_k = (bank_half_hz / bank_step_hz).round() as i32;
@@ -292,7 +327,8 @@ impl<'a> SymbolTracker<'a> {
             .collect();
         let bank_domega: Vec<f64> = bank_dhz
             .iter()
-            .map(|&df_hz| 2.0 * std::f64::consts::PI * df_hz * tsym)
+            // `omega` is stored as the phase advance across the data segment.
+            .map(|&df_hz| 2.0 * std::f64::consts::PI * df_hz * t_data)
             .collect();
         (bank_dhz, bank_domega, bank_step_hz)
     }
@@ -372,8 +408,8 @@ impl<'a> SymbolTracker<'a> {
         (best_i, conf)
     }
 
-    fn pll_predict(theta: &mut f64, omega_used: f64) {
-        *theta = wrap_pm_pi(*theta + omega_used);
+    fn pll_predict(theta: &mut f64, omega_used: f64, sym_scale: f64) {
+        *theta = wrap_pm_pi(*theta + omega_used * sym_scale);
     }
 
     fn pll_correct(
@@ -417,7 +453,7 @@ impl<'a> SymbolTracker<'a> {
         let outcome = if ell < p.n_pre() || is_pilot(ell) {
             self.process_pilot_symbol(ell)
         } else {
-            self.process_data_symbol(llr_out, q_data)?
+            self.process_data_symbol(ell, llr_out, q_data)?
         };
 
         self.apply_freq_snap(outcome.freq_conf, outcome.best_dhz);
@@ -428,8 +464,17 @@ impl<'a> SymbolTracker<'a> {
             0.0
         };
 
+        // Advance by:
+        // - the nominal (tracked) data-chips span
+        // - the receiver's fractional timing adjustment
+        // - the known guard/noise span for this symbol
+        let j_ell = *self
+            .j_seq
+            .get(ell)
+            .ok_or_else(|| anyhow::anyhow!("j_seq out of range"))? as f64;
+        let gi_samp = j_ell * chip_step;
         for t in &mut self.t_sym0 {
-            *t += self.dll.sym_step_samp + phase_adj;
+            *t += self.dll.sym_step_samp + phase_adj + gi_samp;
         }
         Ok(())
     }
@@ -495,7 +540,8 @@ impl<'a> SymbolTracker<'a> {
         }
 
         let err = (z_p.im as f64).atan2((z_p.re as f64) + 1e-18);
-        Self::pll_predict(&mut self.theta, omega_used);
+        let sym_scale = 1.0 + (self.j_seq[ell] as f64) / (p.sf() as f64);
+        Self::pll_predict(&mut self.theta, omega_used, sym_scale);
         if err.is_finite() && z_p.norm() > 1e-6 {
             Self::pll_correct(
                 &mut self.theta,
@@ -530,6 +576,7 @@ impl<'a> SymbolTracker<'a> {
 
     fn process_data_symbol(
         &mut self,
+        ell: usize,
         llr_out: &mut [f64],
         q_data: &mut usize,
     ) -> anyhow::Result<SymbolProcOutcome> {
@@ -596,7 +643,8 @@ impl<'a> SymbolTracker<'a> {
             );
         }
 
-        Self::pll_predict(&mut self.theta, omega_used);
+        let sym_scale = 1.0 + (self.j_seq[ell] as f64) / (p.sf() as f64);
+        Self::pll_predict(&mut self.theta, omega_used, sym_scale);
         let mut rot_llr: Option<Complex32> = None;
         let dll_update = if data_conf.is_finite() && data_conf > 0.10 {
             let mut z_dd = self.buffers.r_best[best_i];
@@ -684,7 +732,7 @@ impl<'a> SymbolTracker<'a> {
             if self.snap_count >= self.freq_snap_confirm {
                 let df2 = self.snap_cand_hz.unwrap_or(0.0);
                 if df2.abs() >= self.freq_snap_min_abs_hz {
-                    self.omega = (self.omega + 2.0 * std::f64::consts::PI * df2 * self.tsym)
+                    self.omega = (self.omega + 2.0 * std::f64::consts::PI * df2 * self.t_data)
                         .clamp(-self.omega_lim, self.omega_lim);
                 }
                 self.snap_cand_hz = None;
@@ -769,53 +817,149 @@ impl ScBltcModem {
         scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
         let p = &self.p;
-        let x_buf = if cfo_hz != 0.0 {
-            let mut tmp = rx_samples.to_vec();
-            derotate_cfo_in_place(&mut tmp, p.fs_hz(), cfo_hz);
-            Some(tmp)
-        } else {
-            None
-        };
-        let x = x_buf.as_deref().unwrap_or(rx_samples);
-        let y = self.rrc.filter_same(x);
-        self.demod_decode_matched(
-            &y,
+        if n_offset_total.is_empty() {
+            return Ok((None, DecodeMeta::error("no_offsets")));
+        }
+
+        let g = gen_code_structured_aes_ctr(
+            &self.key,
             ti_tx,
-            frame_start_sample,
-            n_offset_total,
-            0.0,
-            scl_list_size,
-        )
+            p.n_sym(),
+            p.sf(),
+            p.domain_u32(),
+            p.hop_bw_hz(),
+            JitterSpec {
+                min_chips: p.jitter_min_chips(),
+                span_chips: p.jitter_span_chips(),
+            },
+        );
+
+        // Copy so we can apply CFO derotation and de-hopping before matched filtering.
+        // We'll reuse the CFO-corrected buffer across small offset refinements.
+        let mut x_cfo = rx_samples.to_vec();
+        if cfo_hz != 0.0 {
+            derotate_cfo_in_place(&mut x_cfo, p.fs_hz(), cfo_hz);
+        }
+        let mut x_work = x_cfo.clone();
+
+        // With frequency-hopped waveforms, a ±1 sample error in `n0` can introduce large,
+        // hop-dependent phase jumps across symbols. Under high noise, acquisition can still
+        // "capture" but return `n0` off by a small number of samples. We therefore try a small
+        // symmetric refinement window around the provided offsets, returning the first CRC-pass.
+        let refine_win: isize = 6;
+        let mut deltas: Vec<isize> = Vec::with_capacity(2 * (refine_win as usize) + 1);
+        deltas.push(0);
+        for d in 1..=refine_win {
+            deltas.push(-d);
+            deltas.push(d);
+        }
+
+        let mut first_fail: Option<(Option<Vec<u8>>, DecodeMeta)> = None;
+        for delta in deltas {
+            let mut offs_adj: Vec<usize> = Vec::with_capacity(n_offset_total.len());
+            let mut ok = true;
+            for &o in n_offset_total {
+                let v = (o as isize) + delta;
+                if v < 0 {
+                    ok = false;
+                    break;
+                }
+                offs_adj.push(v as usize);
+            }
+            if !ok {
+                continue;
+            }
+
+            let n0 = *offs_adj
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no_offsets"))?;
+            let start = frame_start_sample
+                .checked_add(n0)
+                .ok_or_else(|| anyhow::anyhow!("frame_start overflow"))?;
+            if start >= x_cfo.len() {
+                continue;
+            }
+
+            x_work.copy_from_slice(&x_cfo);
+            apply_hop_with_start_in_place(
+                &mut x_work,
+                HopParams {
+                    fs_hz: p.fs_hz(),
+                    sf: p.sf(),
+                    osf: p.osf() as usize,
+                    n_tail_syms: p.n_tail(),
+                },
+                &g.f_seq_hz,
+                &g.j_seq_chips,
+                start,
+                -1.0,
+            );
+
+            let y = self.rrc.filter_same(&x_work);
+            let (payload, meta) = match self.demod_decode_matched(
+                &y,
+                ti_tx,
+                frame_start_sample,
+                &offs_adj,
+                scl_list_size,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Some deltas can push the symbol sampler out of range. Treat that as a
+                    // non-fatal miss and keep searching; but don't hide unexpected internal errors.
+                    let msg = e.to_string();
+                    if msg.contains("insufficient_samples") {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            if meta.crc_ok {
+                return Ok((payload, meta));
+            }
+            if first_fail.is_none() {
+                first_fail = Some((payload, meta));
+            }
+        }
+
+        Ok(first_fail.unwrap_or((None, DecodeMeta::error("insufficient_samples"))))
     }
 
     /// Spec §4.C–§4.D.
     ///
-    /// This variant operates on samples that are already RRC matched-filtered.
-    /// If `cfo_hz` is non-zero, a residual derotation is applied on the matched samples.
+    /// This variant expects samples that are already RRC matched-filtered.
+    ///
+    /// Note: for frequency-hopped waveforms, the de-hopping operation must be applied before the
+    /// matched filter. Use [`ScBltcModem::demod_decode_raw`] unless the caller already did the
+    /// de-hopping on raw samples.
     pub fn demod_decode_matched(
         &self,
         y_matched: &[Complex32],
         ti_tx: u64,
         frame_start_sample: usize,
         n_offset_total: &[usize],
-        cfo_hz: f64,
         scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
         let p = &self.p;
         if n_offset_total.is_empty() {
             return Ok((None, DecodeMeta::error("no_offsets")));
         }
+        let y = y_matched;
 
-        let y_buf = if cfo_hz != 0.0 {
-            let mut tmp = y_matched.to_vec();
-            derotate_cfo_in_place(&mut tmp, p.fs_hz(), cfo_hz);
-            Some(tmp)
-        } else {
-            None
-        };
-        let y = y_buf.as_deref().unwrap_or(y_matched);
-
-        let c_seq = gen_code_aes_ctr(&self.key, ti_tx, p.frame_chips(), p.domain_u32());
+        let g = gen_code_structured_aes_ctr(
+            &self.key,
+            ti_tx,
+            p.n_sym(),
+            p.sf(),
+            p.domain_u32(),
+            p.hop_bw_hz(),
+            JitterSpec {
+                min_chips: p.jitter_min_chips(),
+                span_chips: p.jitter_span_chips(),
+            },
+        );
+        let c_seq = g.c_seq;
+        let j_seq = g.j_seq_chips;
 
         let cascade_delay = 2 * self.rrc.delay();
         let frame_start = frame_start_sample as f64;
@@ -825,10 +969,13 @@ impl ScBltcModem {
             p,
             y,
             &c_seq,
+            &j_seq,
             n_finger,
-            n_offset_total,
-            frame_start,
-            cascade_delay,
+            TrackerTiming {
+                n_offset_total,
+                frame_start,
+                cascade_delay,
+            },
         )?;
 
         // Spec §4.D.2–§4.D.3: fill LLRs incrementally while processing each data symbol.

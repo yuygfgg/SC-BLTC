@@ -61,6 +61,28 @@ pub struct Params {
     gamma_hybrid_mult: f64,
     /// RAKE finger search half window (seconds, Specification §4.B.3 / §4.C.1).
     rake_search_half_s: f64,
+
+    /// Frequency-hopping bandwidth `BW_hop` (Hz).
+    ///
+    /// The hop range is centered at baseband 0 Hz, spanning `±BW_hop/2`.
+    hop_bw_hz: f64,
+
+    /// Jitter/guard interval minimum length `L_jitter,min` in chips.
+    jitter_min_chips: usize,
+    /// Jitter/guard interval range `L_jitter,span` in chips.
+    ///
+    /// Total jitter is mapped to `[jitter_min_chips .. jitter_min_chips + jitter_span_chips]`.
+    jitter_span_chips: usize,
+
+    /// Guard/noise filler power relative to the data chip power (dB).
+    ///
+    /// A value of `-3 dB` means the noise has half the power of the data chips.
+    gi_noise_db: f64,
+    /// Optional soft ramp length applied at the start/end of the guard noise (chips).
+    ///
+    /// This is a practical implementation knob to avoid hard edges in the GI while still
+    /// preserving the "noise fill" property.
+    gi_soft_ramp_chips: usize,
 }
 
 impl Default for Params {
@@ -88,18 +110,17 @@ impl Default for Params {
             cfo_search_hz: 8000.0,
             gamma_hybrid_mult: 10.0,
             rake_search_half_s: 0.004,
+
+            hop_bw_hz: 8000.0,
+            jitter_min_chips: 40,
+            jitter_span_chips: 50,
+            gi_noise_db: -3.0,
+            gi_soft_ramp_chips: 8,
         }
     }
 }
 
 impl Params {
-    /// Create a new `Params` instance.
-    ///
-    /// Parameters are fixed by the SC-BLTC specification; this is equivalent to [`Default`].
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn fs_hz(&self) -> u32 {
         self.fs_hz
     }
@@ -188,9 +209,44 @@ impl Params {
         self.rake_search_half_s
     }
 
-    /// Chip duration `T_c = 1/R_c` (seconds).
-    pub fn tc_s(&self) -> f64 {
-        1.0 / (self.rc_chip_sps as f64)
+    /// Hop bandwidth `BW_hop` (Hz).
+    pub fn hop_bw_hz(&self) -> f64 {
+        self.hop_bw_hz
+    }
+
+    /// Jitter/guard minimum length in chips.
+    pub fn jitter_min_chips(&self) -> usize {
+        self.jitter_min_chips
+    }
+
+    /// Jitter/guard span (additional chips beyond min).
+    pub fn jitter_span_chips(&self) -> usize {
+        self.jitter_span_chips
+    }
+
+    /// Jitter/guard maximum length in chips.
+    pub fn jitter_max_chips(&self) -> usize {
+        self.jitter_min_chips + self.jitter_span_chips
+    }
+
+    /// Guard/noise level relative to the data chips (dB).
+    pub fn gi_noise_db(&self) -> f64 {
+        self.gi_noise_db
+    }
+
+    /// Guard/noise power relative to the data chips (linear).
+    pub fn gi_noise_power_lin(&self) -> f64 {
+        10f64.powf(self.gi_noise_db / 10.0)
+    }
+
+    /// Guard/noise stddev relative to unit-power chips.
+    pub fn gi_noise_std(&self) -> f64 {
+        self.gi_noise_power_lin().max(0.0).sqrt()
+    }
+
+    /// Soft ramp length used inside guard intervals (chips).
+    pub fn gi_soft_ramp_chips(&self) -> usize {
+        self.gi_soft_ramp_chips
     }
 
     /// Samples per spread symbol: `SF * OSF`.
@@ -198,18 +254,10 @@ impl Params {
         self.sf * (self.osf as usize)
     }
 
-    /// Chips per frame: `N_sym * SF`.
-    pub fn frame_chips(&self) -> usize {
-        self.n_sym * self.sf
-    }
-
-    /// Samples per frame: `frame_chips * OSF`.
-    pub fn frame_samples(&self) -> usize {
-        self.frame_chips() * (self.osf as usize)
-    }
-
-    /// Samples per frame including the tail padding (Specification §3.E2).
-    pub fn frame_samples_with_tail(&self) -> usize {
-        (self.n_sym + self.n_tail) * self.sf * (self.osf as usize)
+    /// Upper bound on the total transmitted samples for a frame, assuming max jitter.
+    pub fn frame_max_samples_with_jitter(&self) -> usize {
+        let per_sym = self.sf + self.jitter_max_chips();
+        let chips = self.n_sym * per_sym + self.n_tail * self.sf;
+        chips * (self.osf as usize)
     }
 }

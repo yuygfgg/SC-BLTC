@@ -6,7 +6,8 @@
 //! - CFO in a limited band using an FFT peak search
 //!
 //! Coarse stage:
-//! - multiply a 2-symbol preamble reference with a window of received samples ("despread then FFT")
+//! - coherently accumulate the two preamble symbols (data segments only) as one sparse window
+//!   ("despread then FFT"), skipping the symbol-0 guard/noise by inserting zeros
 //! - zero-pad to `N_FFT` and take an FFT
 //! - keep the top-K hypotheses by peak power in the CFO search band
 //!
@@ -21,13 +22,10 @@
 //! base(ti)  = (ti - ti_min) * iv_samples
 //! start     = base(ti) + off
 //! ```
-//!
-//! `matched` indicates whether `rx_window` is raw baseband (`false`) or already matched-filtered
-//! (`true`). The reference is built accordingly (Specification §4.B.2).
 
 use super::{AcqResult, ScBltcModem};
-use crate::crypto::gen_code_aes_ctr;
-use crate::modem::util::pulse_shape_chips;
+use crate::crypto::{gen_code_structured_aes_ctr, JitterSpec};
+use crate::modem::util::{derotate_cfo_in_place, pulse_shape_chips};
 use num_complex::Complex32;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -68,13 +66,20 @@ struct AcqContext {
     iv_samples: usize,
     rake_search_half_samples: usize,
     l_sym: usize,
-    n_ref_pre: usize,
+    /// Length (samples) of a single preamble data segment (SF * OSF).
+    n_ref_pre0: usize,
+    /// Coarse/refine preamble window length:
+    /// `sym0_data || zeros(max_j0) || sym1_data` (samples).
+    n_ref_pre_acq: usize,
+    /// Sample offset from symbol-0 start to symbol-1 start for each TI hypothesis.
+    pre1_delta_samp_by_ti: Vec<usize>,
     pilot_timing_win: isize,
     fs: f64,
     nfft: usize,
     bin_max: isize,
     scratch_len: usize,
-    ref_pre_conj_by_ti: Vec<Vec<Complex32>>,
+    ref_pre0_conj_by_ti: Vec<Vec<Complex32>>,
+    ref_pre1_conj_by_ti: Vec<Vec<Complex32>>,
 }
 
 impl ScBltcModem {
@@ -128,23 +133,12 @@ impl ScBltcModem {
         (acc.norm_sqr() as f64).max(0.0)
     }
 
-    fn build_pilot_ref(
-        &self,
-        c_seq: &[i8],
-        ell: usize,
-        matched: bool,
-    ) -> anyhow::Result<Vec<Complex32>> {
+    fn build_symbol_ref_tx_shaped(&self, chips: &[i8], hop_hz: f64) -> Vec<Complex32> {
         let p = &self.p;
-        if (ell + 1) * p.sf() > c_seq.len() {
-            anyhow::bail!("pilot ref build out of range");
-        }
-        let chips = &c_seq[ell * p.sf()..(ell + 1) * p.sf()];
-        let x = pulse_shape_chips(chips, &self.rrc, p.osf() as usize);
-        if matched {
-            Ok(self.rrc.filter_same(&x))
-        } else {
-            Ok(x)
-        }
+        let mut x = pulse_shape_chips(chips, &self.rrc, p.osf() as usize);
+        // Apply the hop for this symbol (receiver reference uses the same hop).
+        derotate_cfo_in_place(&mut x, p.fs_hz(), -hop_hz);
+        x
     }
 
     fn prepare_acq_context(
@@ -152,7 +146,6 @@ impl ScBltcModem {
         rx_window: &[Complex32],
         ti_min: u64,
         n_ti: usize,
-        matched: bool,
     ) -> anyhow::Result<AcqContext> {
         let p = &self.p;
         let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as usize;
@@ -166,22 +159,31 @@ impl ScBltcModem {
             ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
 
         let l_sym = p.chip_samples();
-        let n_ref_pre = p.n_pre() * l_sym;
+        let n_ref_pre0 = l_sym;
+        let max_j0_samp = p.jitter_max_chips() * (p.osf() as usize);
+        // Two preamble symbols coherently accumulated, skipping symbol-0 GI:
+        // `sym0_data || zeros(j0) || sym1_data`.
+        //
+        // We size the buffer using the *maximum* possible `j0` so the FFT inputs have
+        // a fixed length across TI hypotheses. Each TI places the symbol-1 segment at its
+        // actual `j0` offset and leaves the rest as zeros.
+        let n_ref_pre_acq = 2 * l_sym + max_j0_samp;
 
-        if p.nfft_acq() < n_ref_pre {
-            anyhow::bail!("Params.nfft_acq must be >= Npre*SF*OSF");
+        if p.nfft_acq() < n_ref_pre_acq {
+            anyhow::bail!(
+                "Params.nfft_acq must be >= (2*SF + jitter_max)*OSF (need >= {}, got {})",
+                n_ref_pre_acq,
+                p.nfft_acq()
+            );
         }
 
-        let ell_last_pilot = 2 + 5 * (p.n_pilot().saturating_sub(1));
-        let last_pilot_end = (ell_last_pilot + 1) * l_sym;
         let pilot_timing_win: isize = 32;
-        let verify_need = last_pilot_end + (pilot_timing_win as usize);
-
+        let frame_max = p.frame_max_samples_with_jitter();
         let need = n_ti
             .checked_mul(iv_samples)
-            .and_then(|v| v.checked_add(iv_samples))
             .and_then(|v| v.checked_add(rake_search_half_samples))
-            .and_then(|v| v.checked_add(verify_need))
+            .and_then(|v| v.checked_add(frame_max))
+            .and_then(|v| v.checked_add(32))
             .ok_or_else(|| anyhow::anyhow!("window_size_overflow"))?;
         if rx_window.len() < need {
             anyhow::bail!(
@@ -200,30 +202,75 @@ impl ScBltcModem {
 
         let scratch_len = self.fft_acq_scratch_len;
 
-        let ref_pre_conj_by_ti: Vec<Vec<Complex32>> = (0..n_ti)
-            .map(|ti_idx| {
-                let ti = ti_min + (ti_idx as u64);
-                let ref_pre = if matched {
-                    self.make_ref_preamble_matched(ti)
-                } else {
-                    self.make_ref_preamble_tx_shaped(ti)
-                };
-                debug_assert_eq!(ref_pre.len(), n_ref_pre);
-                ref_pre.iter().map(|v| v.conj()).collect()
-            })
-            .collect();
+        let mut pre1_delta_samp_by_ti: Vec<usize> = Vec::with_capacity(n_ti);
+        let mut ref_pre0_conj_by_ti: Vec<Vec<Complex32>> = Vec::with_capacity(n_ti);
+        let mut ref_pre1_conj_by_ti: Vec<Vec<Complex32>> = Vec::with_capacity(n_ti);
+        for ti_idx in 0..n_ti {
+            let ti = ti_min + (ti_idx as u64);
+            let g = gen_code_structured_aes_ctr(
+                &self.key,
+                ti,
+                p.n_sym(),
+                p.sf(),
+                p.domain_u32(),
+                p.hop_bw_hz(),
+                JitterSpec {
+                    min_chips: p.jitter_min_chips(),
+                    span_chips: p.jitter_span_chips(),
+                },
+            );
+
+            let j0 = g.j_seq_chips.first().copied().unwrap_or(0);
+            let delta_sym1 = l_sym + j0 * (p.osf() as usize);
+            pre1_delta_samp_by_ti.push(delta_sym1);
+
+            // Preamble symbol 0 uses Walsh index 0, so the chips are just C_seq[0].
+            let chips0 = &g.c_seq[0..p.sf()];
+            let mut ref0 = pulse_shape_chips(chips0, &self.rrc, p.osf() as usize);
+            // Apply the hop for symbol 0 (frame-local phase starts at 1 at the frame start).
+            derotate_cfo_in_place(&mut ref0, p.fs_hz(), -g.f_seq_hz[0]);
+            debug_assert_eq!(ref0.len(), n_ref_pre0);
+            ref_pre0_conj_by_ti.push(ref0.iter().map(|v| v.conj()).collect());
+
+            // Preamble symbol 1 is `-W0`, i.e. `-C_seq[sf..2sf]`.
+            let seg1 = p.sf();
+            let chips1 = &g.c_seq[seg1..seg1 + p.sf()];
+            let mut ref1 = pulse_shape_chips(chips1, &self.rrc, p.osf() as usize);
+            derotate_cfo_in_place(&mut ref1, p.fs_hz(), -g.f_seq_hz[1]);
+            for v in &mut ref1 {
+                *v = -*v;
+            }
+            // Preserve the hop's phase continuity across the (data+GI) span of symbol 0.
+            //
+            // Acquisition coherently accumulates both preamble symbols, so symbol 1's reference
+            // must include the accumulated phase at its start; otherwise the two segments would
+            // carry an artificial phase jump.
+            let fs_f32 = p.fs_hz() as f32;
+            let phi0 = (2.0 * std::f32::consts::PI * (g.f_seq_hz[0] as f32) * (delta_sym1 as f32)
+                / fs_f32)
+                .rem_euclid(2.0 * std::f32::consts::PI);
+            let ph0 = Complex32::from_polar(1.0, phi0);
+            for v in &mut ref1 {
+                *v *= ph0;
+            }
+            debug_assert_eq!(ref1.len(), n_ref_pre0);
+            ref_pre1_conj_by_ti.push(ref1.iter().map(|v| v.conj()).collect());
+        }
 
         Ok(AcqContext {
             iv_samples,
             rake_search_half_samples,
             l_sym,
-            n_ref_pre,
+            n_ref_pre0,
+            n_ref_pre_acq,
+            pre1_delta_samp_by_ti,
             pilot_timing_win,
             fs,
             nfft,
             bin_max,
             scratch_len,
-            ref_pre_conj_by_ti,
+            ref_pre0_conj_by_ti,
+            ref_pre1_conj_by_ti,
         })
     }
 
@@ -267,19 +314,35 @@ impl ScBltcModem {
                     let scratch = &mut state.1;
                     let ti = ti_min + (ti_idx as u64);
                     let base = ti_idx * ctx.iv_samples;
-                    let refc = &ctx.ref_pre_conj_by_ti[ti_idx];
+                    let ref0 = &ctx.ref_pre0_conj_by_ti[ti_idx];
+                    let ref1 = &ctx.ref_pre1_conj_by_ti[ti_idx];
+                    let delta_sym1 = ctx.pre1_delta_samp_by_ti[ti_idx];
                     let mut local_topk: Vec<Cand> = Vec::with_capacity(k_keep);
 
                     for off in off0..off1 {
                         let y0 = base + off;
-                        let rx_slice = &rx_window[y0..y0 + ctx.n_ref_pre];
-                        for (dst, (r, c)) in buf[..ctx.n_ref_pre]
+                        let y1 = y0 + delta_sym1;
+
+                        // Two-symbol sparse preamble window (sym0, zeros(GI), sym1).
+                        buf[..ctx.n_ref_pre_acq].fill(Complex32::new(0.0, 0.0));
+
+                        for (dst, (r, c)) in buf[..ctx.n_ref_pre0]
                             .iter_mut()
-                            .zip(rx_slice.iter().zip(refc.iter()))
+                            .zip(rx_window[y0..y0 + ctx.n_ref_pre0].iter().zip(ref0.iter()))
                         {
                             *dst = *r * *c;
                         }
-                        buf[ctx.n_ref_pre..].fill(Complex32::new(0.0, 0.0));
+
+                        let sym1_off = delta_sym1;
+                        let sym1_end = sym1_off + ctx.n_ref_pre0;
+                        debug_assert!(sym1_end <= ctx.n_ref_pre_acq);
+                        for (dst, (r, c)) in buf[sym1_off..sym1_end]
+                            .iter_mut()
+                            .zip(rx_window[y1..y1 + ctx.n_ref_pre0].iter().zip(ref1.iter()))
+                        {
+                            *dst = *r * *c;
+                        }
+                        buf[ctx.n_ref_pre_acq..].fill(Complex32::new(0.0, 0.0));
 
                         fft.process_with_scratch(&mut buf[..], &mut scratch[..]);
 
@@ -349,7 +412,6 @@ impl ScBltcModem {
         rx_window: &[Complex32],
         ti_min: u64,
         n_ti: usize,
-        matched: bool,
         ctx: &AcqContext,
         topk: &[Cand],
     ) -> anyhow::Result<Option<(Cand, f64, f64)>> {
@@ -363,13 +425,30 @@ impl ScBltcModem {
             return Ok(None);
         }
 
-        let e_pre: f64 = ctx.ref_pre_conj_by_ti[0]
+        let e_pre0: f64 = ctx.ref_pre0_conj_by_ti[0]
             .iter()
             .map(|v| v.norm_sqr() as f64)
             .sum();
+        let e_pre1: f64 = ctx.ref_pre1_conj_by_ti[0]
+            .iter()
+            .map(|v| v.norm_sqr() as f64)
+            .sum();
+        let e_pre: f64 = e_pre0 + e_pre1;
 
-        let c_seq_tmp = gen_code_aes_ctr(&self.key, ti_min, p.frame_chips(), p.domain_u32());
-        let ref_sym_tmp = self.build_pilot_ref(&c_seq_tmp, 2, matched)?;
+        let g_tmp = gen_code_structured_aes_ctr(
+            &self.key,
+            ti_min,
+            p.n_sym(),
+            p.sf(),
+            p.domain_u32(),
+            p.hop_bw_hz(),
+            JitterSpec {
+                min_chips: p.jitter_min_chips(),
+                span_chips: p.jitter_span_chips(),
+            },
+        );
+        let ref_sym_tmp = self
+            .build_symbol_ref_tx_shaped(&g_tmp.c_seq[2 * p.sf()..3 * p.sf()], g_tmp.f_seq_hz[2]);
         let e_sym: f64 = ref_sym_tmp.iter().map(|v| v.norm_sqr() as f64).sum();
         let e_total = e_pre + (p.n_pilot() as f64) * e_sym;
         let gamma = p.gamma_hybrid_mult() * sigma2_hat * e_total;
@@ -379,16 +458,40 @@ impl ScBltcModem {
         ti_needed.dedup();
 
         let mut pilot_ref_conj_by_ti: Vec<Option<Vec<Vec<Complex32>>>> = vec![None; n_ti];
+        let mut sym_pos_samp_by_ti: Vec<Option<Vec<usize>>> = vec![None; n_ti];
         for ti_idx in ti_needed {
             let ti = ti_min + (ti_idx as u64);
-            let c_seq = gen_code_aes_ctr(&self.key, ti, p.frame_chips(), p.domain_u32());
+            let g = gen_code_structured_aes_ctr(
+                &self.key,
+                ti,
+                p.n_sym(),
+                p.sf(),
+                p.domain_u32(),
+                p.hop_bw_hz(),
+                JitterSpec {
+                    min_chips: p.jitter_min_chips(),
+                    span_chips: p.jitter_span_chips(),
+                },
+            );
             let mut pilots_this_ti: Vec<Vec<Complex32>> = Vec::with_capacity(p.n_pilot());
             for r in 0..p.n_pilot() {
                 let ell = 2 + 5 * r;
-                let ref_p = self.build_pilot_ref(&c_seq, ell, matched)?;
+                let seg0 = ell * p.sf();
+                let ref_p =
+                    self.build_symbol_ref_tx_shaped(&g.c_seq[seg0..seg0 + p.sf()], g.f_seq_hz[ell]);
                 pilots_this_ti.push(ref_p.iter().map(|v| v.conj()).collect());
             }
             pilot_ref_conj_by_ti[ti_idx] = Some(pilots_this_ti);
+
+            // Symbol start positions (in samples) relative to the frame start for this TI.
+            let mut pos: Vec<usize> = Vec::with_capacity(p.n_sym());
+            let mut acc_chips: usize = 0;
+            let osf = p.osf() as usize;
+            for &j_ell in g.j_seq_chips.iter().take(p.n_sym()) {
+                pos.push(acc_chips * osf);
+                acc_chips = acc_chips.saturating_add(p.sf() + j_ell);
+            }
+            sym_pos_samp_by_ti[ti_idx] = Some(pos);
         }
 
         // Spec §4.B.3
@@ -396,15 +499,14 @@ impl ScBltcModem {
         let fine_step_hz: f64 = 0.25;
         let fine_steps: i64 = (fine_span_hz / fine_step_hz).round() as i64;
 
-        let delta_pos_by_pilot: Vec<usize> =
-            (0..p.n_pilot()).map(|r| (2 + 5 * r) * ctx.l_sym).collect();
+        let pilot_ell: Vec<usize> = (0..p.n_pilot()).map(|r| 2 + 5 * r).collect();
 
         let best_final: Option<(Cand, f64, f64)> = topk
             .par_iter()
             .map_init(
                 || {
                     (
-                        vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre],
+                        vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre_acq],
                         vec![Complex32::new(0.0, 0.0); ctx.l_sym],
                     )
                 },
@@ -416,16 +518,32 @@ impl ScBltcModem {
                     let base = ti_idx * ctx.iv_samples;
                     let y0 = base + cand.off;
 
-                    let ref_pre_conj = &ctx.ref_pre_conj_by_ti[ti_idx];
+                    let ref0 = &ctx.ref_pre0_conj_by_ti[ti_idx];
+                    let ref1 = &ctx.ref_pre1_conj_by_ti[ti_idx];
+                    let delta_sym1 = ctx.pre1_delta_samp_by_ti[ti_idx];
                     let pilots = pilot_ref_conj_by_ti[ti_idx]
                         .as_ref()
                         .expect("Pilot refs should exist for candidate TI");
+                    let sym_pos = sym_pos_samp_by_ti[ti_idx]
+                        .as_ref()
+                        .expect("Symbol positions should exist for candidate TI");
 
-                    for (dst, (r, c)) in y_pre.iter_mut().zip(
-                        rx_window[y0..y0 + ctx.n_ref_pre]
-                            .iter()
-                            .zip(ref_pre_conj.iter()),
-                    ) {
+                    // Two-symbol sparse preamble window (sym0, zeros(GI), sym1).
+                    y_pre.fill(Complex32::new(0.0, 0.0));
+                    for (dst, (r, c)) in y_pre[..ctx.n_ref_pre0]
+                        .iter_mut()
+                        .zip(rx_window[y0..y0 + ctx.n_ref_pre0].iter().zip(ref0.iter()))
+                    {
+                        *dst = *r * *c;
+                    }
+                    let y1 = y0 + delta_sym1;
+                    let sym1_start = delta_sym1;
+                    let sym1_end = sym1_start + ctx.n_ref_pre0;
+                    debug_assert!(sym1_end <= y_pre.len());
+                    for (dst, (r, c)) in y_pre[sym1_start..sym1_end]
+                        .iter_mut()
+                        .zip(rx_window[y1..y1 + ctx.n_ref_pre0].iter().zip(ref1.iter()))
+                    {
                         *dst = *r * *c;
                     }
 
@@ -448,7 +566,7 @@ impl ScBltcModem {
                     for r in 0..p.n_pilot() {
                         let refc = &pilots[r];
                         debug_assert_eq!(refc.len(), ctx.l_sym);
-                        let delta_pos = delta_pos_by_pilot[r];
+                        let delta_pos = sym_pos[pilot_ell[r]];
 
                         let mut ph = Complex32::new(1.0, 0.0);
                         for (dst, c) in ref_rot.iter_mut().zip(refc.iter()) {
@@ -509,14 +627,30 @@ impl ScBltcModem {
         let p = &self.p;
         let best_ti_idx = (best.ti - ti_min) as usize;
         let base = best_ti_idx * ctx.iv_samples;
-        let ref_pre_conj = &ctx.ref_pre_conj_by_ti[best_ti_idx];
-        let mut ref_pre_rot = vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre];
+        let ref_pre0_conj = &ctx.ref_pre0_conj_by_ti[best_ti_idx];
+        let mut ref_pre0_rot = vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre0];
         {
             let fs_f32 = p.fs_hz() as f32;
             let dphi = -2.0 * std::f32::consts::PI * (f_fine as f32) / fs_f32;
             let w = Complex32::from_polar(1.0, dphi);
             let mut ph = Complex32::new(1.0, 0.0);
-            for (dst, c) in ref_pre_rot.iter_mut().zip(ref_pre_conj.iter()) {
+            for (dst, c) in ref_pre0_rot.iter_mut().zip(ref_pre0_conj.iter()) {
+                *dst = *c * ph;
+                ph *= w;
+            }
+        }
+
+        // Also build a symbol-1 preamble reference (with the symbol-0 guard/noise gap in between)
+        // to improve timing discrimination under multipath.
+        let delta_sym1 = ctx.pre1_delta_samp_by_ti[best_ti_idx];
+        let ref_pre1_conj = &ctx.ref_pre1_conj_by_ti[best_ti_idx];
+        let mut ref_pre1_rot = vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre0];
+        {
+            let fs_f32 = p.fs_hz() as f32;
+            let dphi = -2.0 * std::f32::consts::PI * (f_fine as f32) / fs_f32;
+            let w = Complex32::from_polar(1.0, dphi);
+            let mut ph = Complex32::new(1.0, 0.0);
+            for (dst, c) in ref_pre1_rot.iter_mut().zip(ref_pre1_conj.iter()) {
                 *dst = *c * ph;
                 ph *= w;
             }
@@ -533,7 +667,7 @@ impl ScBltcModem {
             off_lo = 0;
         }
         let mut off_hi: isize = center + half;
-        let max_start = rx_window.len().saturating_sub(ctx.n_ref_pre);
+        let max_start = rx_window.len().saturating_sub(ctx.n_ref_pre0);
         let max_off = max_start.saturating_sub(base) as isize;
         if off_hi > max_off {
             off_hi = max_off;
@@ -549,7 +683,11 @@ impl ScBltcModem {
                     .map(|i| {
                         let off = (off_lo as usize) + i;
                         let y0 = base + off;
-                        let e = self.corr_energy_no_cfo(rx_window, y0, &ref_pre_rot[..]);
+                        let mut e = self.corr_energy_no_cfo(rx_window, y0, &ref_pre0_rot[..]);
+                        let y1 = y0.saturating_add(delta_sym1);
+                        if y1 + ref_pre1_rot.len() <= rx_window.len() {
+                            e += self.corr_energy_no_cfo(rx_window, y1, &ref_pre1_rot[..]);
+                        }
                         (off, e)
                     })
                     .collect();
@@ -557,7 +695,11 @@ impl ScBltcModem {
                 corr = Vec::with_capacity(n_hyp);
                 for off in (off_lo as usize)..=(off_hi as usize) {
                     let y0 = base + off;
-                    let e = self.corr_energy_no_cfo(rx_window, y0, &ref_pre_rot[..]);
+                    let mut e = self.corr_energy_no_cfo(rx_window, y0, &ref_pre0_rot[..]);
+                    let y1 = y0.saturating_add(delta_sym1);
+                    if y1 + ref_pre1_rot.len() <= rx_window.len() {
+                        e += self.corr_energy_no_cfo(rx_window, y1, &ref_pre1_rot[..]);
+                    }
                     corr.push((off, e));
                 }
             }
@@ -567,8 +709,14 @@ impl ScBltcModem {
         let n0 = corr.first().map(|v| v.0).unwrap_or(best.off);
 
         let min_sep = (p.osf() as usize).max(1);
+        // Keep the best (strongest) finger first; downstream code treats this as the frame's
+        // nominal start for de-hopping and symbol scheduling.
         let mut finger_offsets: Vec<usize> = vec![n0];
         for (off, _) in &corr {
+            // Multipath delays are nonnegative relative to the strongest preamble peak.
+            if *off < n0 {
+                continue;
+            }
             if finger_offsets.iter().all(|&x| x.abs_diff(*off) >= min_sep) {
                 finger_offsets.push(*off);
             }
@@ -576,8 +724,7 @@ impl ScBltcModem {
                 break;
             }
         }
-        finger_offsets.sort_unstable();
-        finger_offsets.dedup();
+        // Do not sort: preserve `n0` as the first element.
 
         Ok(AcqResult {
             ti_hat: best.ti,
@@ -594,13 +741,12 @@ impl ScBltcModem {
         ti_min: u64,
         n_ti: usize,
         n_finger: usize,
-        matched: bool,
     ) -> anyhow::Result<Option<AcqResult>> {
         // Spec §4.B
-        let ctx = self.prepare_acq_context(rx_window, ti_min, n_ti, matched)?;
+        let ctx = self.prepare_acq_context(rx_window, ti_min, n_ti)?;
         let topk = self.find_coarse_candidates(rx_window, ti_min, n_ti, &ctx);
         let Some((best, lambda_best, f_fine)) =
-            self.refine_and_verify_candidates(rx_window, ti_min, n_ti, matched, &ctx, &topk)?
+            self.refine_and_verify_candidates(rx_window, ti_min, n_ti, &ctx, &topk)?
         else {
             return Ok(None);
         };
@@ -621,19 +767,6 @@ impl ScBltcModem {
         n_ti: usize,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
-        self.acquire_fft_window_impl(rx_raw_window, ti_min, n_ti, n_finger, false)
-    }
-
-    /// Blind acquisition over a matched-filtered window (Specification §4.B).
-    ///
-    /// This is useful if the caller already applied the RX RRC matched filter.
-    pub fn acquire_fft_matched_window(
-        &self,
-        y_matched_window: &[Complex32],
-        ti_min: u64,
-        n_ti: usize,
-        n_finger: usize,
-    ) -> anyhow::Result<Option<AcqResult>> {
-        self.acquire_fft_window_impl(y_matched_window, ti_min, n_ti, n_finger, true)
+        self.acquire_fft_window_impl(rx_raw_window, ti_min, n_ti, n_finger)
     }
 }
