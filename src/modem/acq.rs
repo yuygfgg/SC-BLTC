@@ -1,3 +1,30 @@
+//! Blind acquisition via FFT (Specification §4.B).
+//!
+//! The receiver does not know the transmit `TimeIndex` (`TI_tx`), so acquisition searches over:
+//! - `TI_search` in a time window `[ti_min .. ti_min + n_ti)`
+//! - intra-epoch sample offset `off` in `[0 .. iv_samples)`
+//! - CFO in a limited band using an FFT peak search
+//!
+//! Coarse stage:
+//! - multiply a 2-symbol preamble reference with a window of received samples ("despread then FFT")
+//! - zero-pad to `N_FFT` and take an FFT
+//! - keep the top-K hypotheses by peak power in the CFO search band
+//!
+//! Refine/verify stage:
+//! - refine CFO on a small grid around the coarse estimate
+//! - verify candidates with coherent preamble energy + noncoherent pilot energy
+//! - if verified, search for RAKE finger delays around the best preamble offset
+//!
+//! Coordinate system:
+//! ```text
+//! rx_window = [ IV(ti_min) | IV(ti_min+1) | ... ]
+//! base(ti)  = (ti - ti_min) * iv_samples
+//! start     = base(ti) + off
+//! ```
+//!
+//! `matched` indicates whether `rx_window` is raw baseband (`false`) or already matched-filtered
+//! (`true`). The reference is built accordingly (Specification §4.B.2).
+
 use super::{AcqResult, ScBltcModem};
 use crate::crypto::gen_code_aes_ctr;
 use crate::modem::util::pulse_shape_chips;
@@ -581,6 +608,11 @@ impl ScBltcModem {
         Ok(Some(out))
     }
 
+    /// Blind acquisition over a raw baseband window (Specification §4.B).
+    ///
+    /// `rx_raw_window` must contain `n_ti` consecutive IV intervals plus enough guard samples for:
+    /// - candidate verification (preamble + pilots)
+    /// - RAKE finger search around the best preamble offset
     pub fn acquire_fft_raw_window(
         &self,
         rx_raw_window: &[Complex32],
@@ -589,10 +621,14 @@ impl ScBltcModem {
         p_fa_total: f64,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
+        // `p_fa_total` is reserved for a future CFAR-style thresholding rule.
         let _ = p_fa_total; // TODO
         self.acquire_fft_window_impl(rx_raw_window, ti_min, n_ti, n_finger, false)
     }
 
+    /// Blind acquisition over a matched-filtered window (Specification §4.B).
+    ///
+    /// This is useful if the caller already applied the RX RRC matched filter.
     pub fn acquire_fft_matched_window(
         &self,
         y_matched_window: &[Complex32],
@@ -601,6 +637,7 @@ impl ScBltcModem {
         p_fa_total: f64,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
+        // `p_fa_total` is reserved for a future CFAR-style thresholding rule.
         let _ = p_fa_total; // TODO
         self.acquire_fft_window_impl(y_matched_window, ti_min, n_ti, n_finger, true)
     }

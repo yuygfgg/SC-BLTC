@@ -1,10 +1,25 @@
+//! Tracking-loop helpers (Specification §4.C.2).
+//!
+//! The receiver runs two coupled control loops at the symbol rate:
+//! - a carrier phase/frequency loop (PLL/Costas)
+//! - a code timing loop (DLL, early/late gate)
+//!
+//! This module provides a small discrete-time PI loop designer and a state container for the
+//! early/late DLL.
+
+/// Discrete-time PI gains.
 #[derive(Clone, Copy, Debug)]
 pub struct LoopGains {
+    /// Proportional gain.
     pub kp: f64,
+    /// Integral gain.
     pub ki: f64,
 }
 
-/// Spec §4.C.2.
+/// Design a stable 2nd-order discrete-time PI loop (Specification §4.C.2).
+///
+/// The returned gains target a given loop bandwidth and damping factor, using pole mapping
+/// `z = exp(s*T)` rather than a small-`T` approximation.
 pub fn design_2nd_order_loop(loop_bw_hz: f64, damping: f64, update_period_s: f64) -> LoopGains {
     // Discrete-time PI loop design via pole mapping (stable even when ωn·T is not small).
     let bw = loop_bw_hz;
@@ -42,13 +57,20 @@ pub fn design_2nd_order_loop(loop_bw_hz: f64, damping: f64, update_period_s: f64
     LoopGains { kp, ki }
 }
 
+/// Early/late code timing loop state.
 #[derive(Clone, Debug)]
 pub struct EarlyLateDll {
+    /// Current estimate of samples per symbol.
     pub sym_step_samp: f64,
+    /// Proportional gain.
     pub kp: f64,
+    /// Integral gain.
     pub ki: f64,
+    /// Clamp for `sym_step_samp` (minimum).
     pub sym_step_min: f64,
+    /// Clamp for `sym_step_samp` (maximum).
     pub sym_step_max: f64,
+    /// Scale factor applied when the loop is decision-directed.
     pub dd_scale: f64,
 }
 

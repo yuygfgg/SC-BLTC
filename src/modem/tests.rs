@@ -1,3 +1,10 @@
+//! End-to-end tests for the modem pipeline.
+//!
+//! These tests exercise:
+//! - TX frame construction
+//! - acquisition (FFT-based) on synthetic signals
+//! - demodulation/decoding under CFO and simple multipath
+
 use super::*;
 use num_complex::Complex32;
 use rand::rngs::StdRng;

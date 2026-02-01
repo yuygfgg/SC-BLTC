@@ -1,3 +1,25 @@
+//! Tracking demodulator and decoder (Specification §4.C-§4.D).
+//!
+//! Given:
+//! - an acquired `ti_tx` (spreading seed)
+//! - a start sample index for the acquired IV epoch
+//! - one or more RAKE finger offsets within that epoch
+//! this module:
+//! 1) generates the full-frame chip mask `C_seq`
+//! 2) samples chips for each finger with a DLL (early/late gate) and linear interpolation
+//! 3) runs a symbol-rate PLL/Costas loop with a small frequency bank (anti-slip)
+//! 4) combines fingers with MRC and performs Walsh matched filtering (FHT1024)
+//! 5) generates soft LLRs, deinterleaves, and CA-SCL decodes the polar code
+//!
+//! High-level flow:
+//! ```text
+//! y_matched[n]
+//!   -> (per symbol ell) sample chips per finger -> demask with C_seq
+//!   -> MRC combine -> PLL/DLL update
+//!   -> if data: FHT1024 -> LLRs
+//!   -> polar decode -> parse Header/Payload/CRC
+//! ```
+
 use super::util::{derotate_cfo_in_place, is_pilot, wrap_pm_pi};
 use super::{DecodeMeta, ScBltcModem};
 use crate::crypto::gen_code_aes_ctr;
@@ -696,6 +718,9 @@ impl<'a> SymbolTracker<'a> {
 
 impl ScBltcModem {
     /// Spec §4.C–§4.D.
+    ///
+    /// This variant accepts raw samples, optionally derotates CFO at the sample rate, then applies
+    /// the RRC matched filter internally.
     pub fn demod_decode_raw(
         &self,
         rx_samples: &[Complex32],
@@ -726,6 +751,9 @@ impl ScBltcModem {
     }
 
     /// Spec §4.C–§4.D.
+    ///
+    /// This variant operates on samples that are already RRC matched-filtered.
+    /// If `cfo_hz` is non-zero, a residual derotation is applied on the matched samples.
     pub fn demod_decode_matched(
         &self,
         y_matched: &[Complex32],

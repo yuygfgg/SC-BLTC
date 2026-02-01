@@ -1,3 +1,12 @@
+//! Transmit-side frame construction (Specification §3).
+//!
+//! This module turns `(payload, ver, typ, t_tx)` into complex baseband samples:
+//! 1) build `U` (header + payload + CRC + padding)
+//! 2) polar encode + interleave
+//! 3) map bits -> 256-ary Walsh symbol indices
+//! 4) apply cryptographic chip mask and Walsh spreading to form chips
+//! 5) RRC pulse shape + optional tail padding + ramp-down
+
 use super::util::{apply_ramp_down, bits_to_symbols, is_pilot, pulse_shape_chips};
 use super::{ScBltcModem, TxFrame};
 use crate::crypto::gen_code_aes_ctr;
@@ -9,6 +18,10 @@ use anyhow::Context;
 use num_complex::Complex32;
 
 impl ScBltcModem {
+    /// Build a full SC-BLTC frame as complex baseband samples (Specification §3).
+    ///
+    /// - `payload` is limited to 26 bytes by the fixed `K=256` information bit budget.
+    /// - `t_tx` overrides the transmit time (seconds since Unix epoch) and is mainly used by tests.
     pub fn build_frame_samples(
         &self,
         payload: &[u8],
@@ -76,6 +89,10 @@ impl ScBltcModem {
         Ok(TxFrame { ti_tx, samples: x })
     }
 
+    /// Build the local matched-filtered preamble reference used in acquisition (Specification §4.B.2).
+    ///
+    /// This returns:
+    /// `rrc(rx_shape(rrc(tx_shape(chips))))` cropped to the 2-symbol preamble duration.
     pub fn make_ref_preamble_matched(&self, ti_search: u64) -> Vec<Complex32> {
         // Spec §4.B.2 (local reference).
         let p = &self.p;
@@ -90,6 +107,7 @@ impl ScBltcModem {
         y[..(p.n_pre * p.chip_samples())].to_vec()
     }
 
+    /// Build the local TX-shaped (but not matched-filtered) preamble reference (Specification §4.B.2).
     pub fn make_ref_preamble_tx_shaped(&self, ti_search: u64) -> Vec<Complex32> {
         let p = &self.p;
         let n_chips = p.n_pre * p.sf;

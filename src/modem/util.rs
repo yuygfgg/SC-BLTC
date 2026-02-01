@@ -1,15 +1,26 @@
+//! Small modem utilities shared by TX/acquisition/demodulation.
+//!
+//! These helpers mainly encode the fixed frame schedule and small signal-processing primitives.
+
 use crate::rrc::Fir;
 use num_complex::Complex32;
 
+/// Whether spread symbol index `ell` is a pilot (Specification §3.A0).
+///
+/// Layout is:
+/// - ell=0..1: preamble
+/// - then 16 blocks of: `pilot + data + data + data + data`
 pub(super) fn is_pilot(ell: usize) -> bool {
     // Spec §3 / §4: pilots start after the 2-symbol preamble.
     ell >= 2 && (ell - 2).is_multiple_of(5)
 }
 
+/// Wrap an angle to the range (-pi, +pi].
 pub(super) fn wrap_pm_pi(x: f64) -> f64 {
     (x + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI
 }
 
+/// Pack a flat `{0,1}` bit slice into `k`-bit symbol indices (MSB first).
 pub(super) fn bits_to_symbols(bits: &[u8], k: usize) -> Vec<u16> {
     assert!(bits.len().is_multiple_of(k));
     let mut out = Vec::with_capacity(bits.len() / k);
@@ -23,6 +34,7 @@ pub(super) fn bits_to_symbols(bits: &[u8], k: usize) -> Vec<u16> {
     out
 }
 
+/// Upsample chips by `osf` and apply the RRC filter (TX pulse shaping).
 pub(super) fn pulse_shape_chips(chips: &[i8], fir: &Fir, osf: usize) -> Vec<Complex32> {
     let mut up = vec![Complex32::new(0.0, 0.0); chips.len() * osf];
     for (i, &c) in chips.iter().enumerate() {
@@ -31,6 +43,7 @@ pub(super) fn pulse_shape_chips(chips: &[i8], fir: &Fir, osf: usize) -> Vec<Comp
     fir.filter_same(&up)
 }
 
+/// Apply a smooth cosine ramp-down to the tail of a waveform (Specification §3.E2).
 pub(super) fn apply_ramp_down(x: &[Complex32], ramp_n: usize) -> Vec<Complex32> {
     if ramp_n <= 1 || x.is_empty() {
         return x.to_vec();
@@ -46,6 +59,7 @@ pub(super) fn apply_ramp_down(x: &[Complex32], ramp_n: usize) -> Vec<Complex32> 
     y
 }
 
+/// Multiply `x[n]` by `exp(-j*2*pi*cfo*n/fs)` in-place.
 pub(super) fn derotate_cfo_in_place(x: &mut [Complex32], fs_hz: u32, cfo_hz: f64) {
     if cfo_hz == 0.0 {
         return;

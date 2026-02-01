@@ -1,5 +1,18 @@
+//! Root-raised-cosine (RRC) pulse shaping and a small FIR helper.
+//!
+//! The transmitter shapes the chip sequence with an RRC filter and the receiver uses the same taps
+//! as a matched filter (Specification §3.D2 / §4.B.2 / §4.C).
+//!
+//! The generated tap sequence is energy-normalized, so it can be used directly for both TX shaping
+//! and RX matched filtering.
+
 use num_complex::Complex32;
 
+/// Generate unit-energy RRC taps.
+///
+/// - `alpha` is the roll-off factor in `(0, 1]`
+/// - `sps` is samples per symbol (in this project, symbol == chip, so `sps = OSF`)
+/// - `span_symbols` is the filter span in symbols (must be a positive even integer)
 pub fn rrc_taps(alpha: f64, sps: u32, span_symbols: u32) -> anyhow::Result<Vec<f32>> {
     if !(0.0 < alpha && alpha <= 1.0) {
         anyhow::bail!("alpha must be in (0,1]");
@@ -48,16 +61,22 @@ pub fn rrc_taps(alpha: f64, sps: u32, span_symbols: u32) -> anyhow::Result<Vec<f
     Ok(h.into_iter().map(|v| v as f32).collect())
 }
 
+/// A simple complex-valued FIR filter.
+///
+/// The tap vector is applied with a "current sample + previous samples" convention:
+/// `y[n] = sum_{k=0..L-1} taps[k] * x[n-k]`.
 #[derive(Clone, Debug)]
 pub struct Fir {
     pub taps: Vec<f32>,
 }
 
 impl Fir {
+    /// Group delay for symmetric taps (`(L-1)/2`).
     pub fn delay(&self) -> usize {
         (self.taps.len() - 1) / 2
     }
 
+    /// Convolve `x` with the FIR and return an output with the same length as `x`.
     pub fn filter_same(&self, x: &[Complex32]) -> Vec<Complex32> {
         let l = self.taps.len();
         let mut y = vec![Complex32::new(0.0, 0.0); x.len()];
@@ -72,6 +91,7 @@ impl Fir {
         y
     }
 
+    /// Create a stateful version of this FIR for streaming processing.
     pub fn state(&self) -> FirState {
         FirState {
             taps: self.taps.clone(),
@@ -80,6 +100,7 @@ impl Fir {
     }
 }
 
+/// Stateful FIR filter for block-by-block processing.
 #[derive(Clone, Debug)]
 pub struct FirState {
     taps: Vec<f32>,
@@ -87,6 +108,7 @@ pub struct FirState {
 }
 
 impl FirState {
+    /// Filter a block, preserving the internal delay line across calls.
     pub fn process_block(&mut self, x: &[Complex32]) -> Vec<Complex32> {
         let l = self.taps.len();
         let mut y = vec![Complex32::new(0.0, 0.0); x.len()];

@@ -1,7 +1,22 @@
+//! Polar code (N=512, K=256) encoder and CA-SCL decoder.
+//!
+//! Specification references:
+//! - Encoder/frozen set: Specification §3.A0
+//! - Decoder: Specification §4.D
+//!
+//! Frozen-set construction uses Polarization Weight (PW) ranking for `N=512` with
+//! `beta = 2^(1/4)`. The resulting mask is computed once and cached.
+//!
+//! The decoder is CRC-aided SCL (CA-SCL): it keeps up to `L` candidate paths, then selects the
+//! best-metric path that passes CRC32C embedded inside `U`. If none pass, it returns the
+//! best-metric path.
+
 use crate::frame;
 use std::sync::OnceLock;
 
+/// Polar codeword length `N` (coded bits).
 pub const POLAR_N: usize = 512;
+/// Polar information length `K` (uncoded bits).
 pub const POLAR_K: usize = 256;
 
 const PW_BETA: f64 = 1.189_207_115_002_721; // 2^(1/4)
@@ -108,7 +123,10 @@ fn polar_transform_in_place(x: &mut [u8]) {
     }
 }
 
-/// Spec §3.A0: (N,K)=(512,256)
+/// Polar encoder for `U` (256 bits) to `B` (512 bits).
+///
+/// - Frozen bits are set to zero.
+/// - Information bits are inserted in ascending index order over the information set.
 pub fn polar_encode_u256(u_bits: &[u8; POLAR_K]) -> [u8; POLAR_N] {
     let info_pos = &polar_const().info_pos;
     let mut u = [0u8; POLAR_N];
@@ -222,7 +240,12 @@ fn decode_node(
     }
 }
 
-/// CRC-aided SCL decoder for Spec §4.D: returns the decoded 256-bit `U` payload (header+payload+crc+pad).
+/// CRC-aided SCL decoder (CA-SCL) from codeword LLRs.
+///
+/// - `llr_in[i] > 0` favors bit `0`, `llr_in[i] < 0` favors bit `1`.
+/// - `list_size` is clamped to `[1, 64]`.
+///
+/// Returns the estimated `U` (256 bits: header + payload + CRC + padding).
 pub fn polar_decode_to_u256_from_llr(llr_in: &[f64; POLAR_N], list_size: usize) -> [u8; POLAR_K] {
     let frozen = &polar_const().frozen;
     let info_pos = &polar_const().info_pos;

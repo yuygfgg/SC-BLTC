@@ -1,17 +1,39 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+//! Frame format and CRC (Specification §3.A0).
+//!
+//! This module builds/parses the uncoded information bits `U` (256 bits) that sit behind the
+//! spreading/modulation layer.
+//!
+//! Byte layout (32 bytes total):
+//! ```text
+//! 0..2            Header
+//! 2..(2+Len)      Payload (0..26 bytes)
+//! (2+Len)..+4     CRC32C(Header||Payload)
+//! ...             zero padding to 32 bytes
+//! ```
+//!
+//! Bit order:
+//! - bytes are expanded MSB-first (big-endian bit order within each byte)
+//! - CRC is stored as 4 bytes, big-endian
+
 /// Spec §3.A0 (Header).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Header {
+    /// Protocol version (`Ver`, 4 bits).
     pub ver: u8,
+    /// Message type (`Type`, 4 bits).
     pub typ: u8,
+    /// Payload length in bytes (`Len`, 8 bits).
     pub length: u8,
 }
 
 impl Header {
+    /// Pack the header into 2 bytes: `(Ver<<4)|Type`, then `Len`.
     pub fn to_bytes(self) -> [u8; 2] {
         let b0 = ((self.ver & 0x0f) << 4) | (self.typ & 0x0f);
         [b0, self.length]
     }
 
+    /// Parse a 2-byte header produced by [`Header::to_bytes`].
     pub fn from_bytes(b: [u8; 2]) -> Self {
         let ver = (b[0] >> 4) & 0x0f;
         let typ = b[0] & 0x0f;
@@ -44,6 +66,9 @@ const fn crc32c_table() -> [u32; 256] {
 
 const CRC32C_TBL: [u32; 256] = crc32c_table();
 
+/// CRC-32C (Castagnoli) over `data`.
+///
+/// This uses a small 256-entry lookup table computed at compile time.
 pub fn crc32c(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xffff_ffff;
     for &b in data {
@@ -76,7 +101,9 @@ fn bits_be_to_bytes(bits: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Spec §3.A0.
+/// Build `U` (256 bits) from the plaintext header fields and the payload (Specification §3.A0).
+///
+/// Returns a `Vec<u8>` of length 256, where each element is a bit in `{0,1}`.
 pub fn build_u_bits(payload: &[u8], ver: u8, typ: u8) -> anyhow::Result<Vec<u8>> {
     if payload.len() > 26 {
         anyhow::bail!("payload too long for K=256 (max 26 bytes)");
@@ -101,6 +128,9 @@ pub fn build_u_bits(payload: &[u8], ver: u8, typ: u8) -> anyhow::Result<Vec<u8>>
     Ok(bits)
 }
 
+/// Parse `U` (256 bits) back into header and payload, and verify CRC32C.
+///
+/// The boolean indicates whether CRC passes.
 pub fn parse_u_bits(u_bits: &[u8]) -> anyhow::Result<(Header, Vec<u8>, bool)> {
     if u_bits.len() != 256 {
         anyhow::bail!("U must be 256 bits");

@@ -1,7 +1,26 @@
+//! Cryptographic spreading sequence generator (Specification §2).
+//!
+//! The protocol uses AES-CTR as a CSPRNG. For a shared key `K_sec` and a time counter `TI_tx`, it
+//! produces a pseudo-random chip mask `C_seq[j]` where each chip is either `+1` or `-1`.
+//!
+//! Nonce/counter layout (16 bytes):
+//! ```text
+//! IV = TI(u64, big-endian) || Domain(u32, big-endian) || BlockCounter(u32, big-endian)
+//! ```
+//!
+//! Keystream-bit to chip mapping:
+//! - consume keystream bits MSB -> LSB within each byte
+//! - bit=0 -> +1, bit=1 -> -1
+
 use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
 
-/// Spec §2 (GenCode). Returns chips in {+1,-1}.
+/// Spec §2 (GenCode).
+///
+/// Generate a chip sequence of length `length` (each chip is `+1` or `-1`).
+///
+/// - `time_index` is `TI = floor(t / IV_res)` (the spec uses 1ms resolution)
+/// - `domain_u32` is domain separation to avoid keystream reuse across applications
 pub fn gen_code_aes_ctr(
     key: &[u8; 32],
     time_index: u64,

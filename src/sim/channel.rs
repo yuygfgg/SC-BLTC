@@ -1,6 +1,24 @@
+//! Simple channel impairment models used by the CLI tools.
+//!
+//! These helpers are for simulation/testing (AWGN, CFO, Doppler, multipath) and are not part of
+//! the SC-BLTC protocol itself.
+//!
+//! Per-sample processing order:
+//! ```text
+//! x[n]
+//!   -> multipath FIR (optional)
+//!   -> complex rotation for CFO + Doppler (optional)
+//!   -> amplitude scaling
+//!   -> AWGN (optional)
+//!   -> y[n]
+//! ```
+
 use anyhow::Context;
 use num_complex::Complex32;
 
+/// A tiny deterministic RNG.
+///
+/// This is used for reproducible simulations; it is not cryptographically secure.
 #[derive(Clone)]
 pub struct Rng64 {
     st: u64,
@@ -28,6 +46,7 @@ impl Rng64 {
     }
 }
 
+/// Box-Muller normal generator with a cached spare sample.
 pub struct Gauss {
     have: bool,
     spare: f32,
@@ -64,6 +83,7 @@ impl Gauss {
     }
 }
 
+/// A small complex FIR used to model multipath.
 #[derive(Clone)]
 pub struct MultipathFir {
     taps: Vec<Complex32>,
@@ -72,6 +92,7 @@ pub struct MultipathFir {
 }
 
 impl MultipathFir {
+    /// Create a multipath FIR from taps `h[k]` (tap 0 is the direct path).
     pub fn new(taps: Vec<Complex32>) -> anyhow::Result<Self> {
         if taps.is_empty() {
             anyhow::bail!("multipath taps must be non-empty");
@@ -83,6 +104,7 @@ impl MultipathFir {
         })
     }
 
+    /// Filter a single sample through the multipath channel.
     pub fn filter(&mut self, x: Complex32) -> Complex32 {
         let l = self.taps.len();
         self.dl[self.pos] = x;
@@ -99,6 +121,7 @@ impl MultipathFir {
     }
 }
 
+/// Ornstein-Uhlenbeck (OU) process for correlated Doppler drift (in Hz).
 pub struct DopplerOu {
     f_hz: f64,
     a: f64,
@@ -107,6 +130,9 @@ pub struct DopplerOu {
 }
 
 impl DopplerOu {
+    /// Create an OU process with target standard deviation `std_hz` and correlation time `tau_s`.
+    ///
+    /// `fs_hz` is the sample rate used to discretize the process.
     pub fn new(std_hz: f64, tau_s: f64, fs_hz: f64, max_abs_hz: f64) -> Self {
         let a = if tau_s > 0.0 {
             (-1.0 / (fs_hz * tau_s)).exp()
@@ -122,11 +148,13 @@ impl DopplerOu {
         }
     }
 
+    /// Force the current Doppler state (Hz).
     pub fn set_f_hz(&mut self, f_hz: f64) {
         self.f_hz = f_hz;
         self.clamp_f_hz();
     }
 
+    /// Advance the process by one sample and return the new Doppler (Hz).
     pub fn step_hz(&mut self, rng: &mut Rng64, gauss: &mut Gauss) -> f64 {
         let w = gauss.next(rng) as f64;
         self.f_hz = self.a * self.f_hz + self.b * w;
@@ -141,6 +169,7 @@ impl DopplerOu {
     }
 }
 
+/// Mutable per-stream channel state (phase accumulator + optional multipath/Doppler models).
 pub struct ChannelState {
     phi: f32,
     mp: Option<MultipathFir>,
@@ -148,6 +177,7 @@ pub struct ChannelState {
 }
 
 impl ChannelState {
+    /// Create a channel state with optional multipath and Doppler components.
     pub fn new(mp: Option<MultipathFir>, doppler: Option<DopplerOu>) -> Self {
         Self {
             phi: 0.0,
@@ -161,6 +191,7 @@ impl ChannelState {
     }
 }
 
+/// Normalize taps to unit energy.
 pub fn normalize_taps(mut taps: Vec<Complex32>) -> Vec<Complex32> {
     let e: f32 = taps.iter().map(|c| c.norm_sqr()).sum();
     if e > 0.0 {
@@ -172,6 +203,9 @@ pub fn normalize_taps(mut taps: Vec<Complex32>) -> Vec<Complex32> {
     taps
 }
 
+/// Parse a tap specification string: `delay_samp,gain_db[,phase_deg]`.
+///
+/// If `phase_deg` is omitted, a random phase is chosen.
 pub fn parse_mp_tap(s: &str, rng: &mut Rng64) -> anyhow::Result<(usize, Complex32)> {
     let ss = s.trim().replace(':', ",");
     let parts: Vec<&str> = ss
@@ -194,6 +228,7 @@ pub fn parse_mp_tap(s: &str, rng: &mut Rng64) -> anyhow::Result<(usize, Complex3
     Ok((delay, Complex32::from_polar(gain_lin, phase_rad)))
 }
 
+/// Build random multipath taps with a simple exponentially decaying power-delay profile.
 pub fn build_random_multipath(
     paths: usize,
     max_delay: usize,
@@ -221,6 +256,9 @@ pub fn build_random_multipath(
     normalize_taps(taps)
 }
 
+/// Apply channel effects to one complex baseband sample.
+///
+/// `fs_actual_hz` is the actual sample clock (can differ from nominal `F_s` to model SRO).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_channel_sample(
     x: Complex32,

@@ -1,3 +1,12 @@
+//! SC-BLTC receiver over TCP (raw I/Q streaming).
+//!
+//! This tool accepts a TCP stream produced by `tx` and continuously attempts blind acquisition
+//! and decoding.
+//!
+//! At connection setup, the sender provides `t0_ns` (Unix time for sample index 0). The receiver
+//! uses this timestamp plus the running sample counter to map buffered samples to the protocol's
+//! `TimeIndex` (`TI = floor(t / IV_res)`), which defines the blind search space.
+
 use anyhow::Context;
 use clap::Parser;
 use num_complex::Complex32;
@@ -9,10 +18,11 @@ use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+/// TCP stream magic for the toy I/Q transport.
 const MAGIC: &[u8; 8] = b"SCBLTC01";
 
 #[derive(Parser, Debug)]
-#[command(about = "SC-BLTC receiver over TCP (no system audio stack)")]
+#[command(about = "SC-BLTC receiver over TCP")]
 struct Args {
     /// Bind address, e.g. 0.0.0.0:5555 or 127.0.0.1:5555
     #[arg(long, default_value = "127.0.0.1:5555")]

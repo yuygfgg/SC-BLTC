@@ -1,3 +1,17 @@
+//! A fixed-capacity ring buffer with absolute indexing.
+//!
+//! This is used by the TCP receiver to maintain a sliding window of recent I/Q samples without
+//! reallocations, while still being able to address samples by an absolute counter.
+//!
+//! ```text
+//! logical indices:  [abs_base .. abs_next)
+//! physical buffer:  buf[abs % cap]
+//! ```
+//!
+//! When new samples are pushed and capacity is exceeded, `abs_base` advances and the oldest samples
+//! are dropped.
+
+/// Ring buffer storing the most recent `capacity` items.
 #[derive(Debug, Clone)]
 pub struct Ring<T: Copy> {
     buf: Vec<T>,
@@ -7,6 +21,7 @@ pub struct Ring<T: Copy> {
 }
 
 impl<T: Copy + Default> Ring<T> {
+    /// Create a ring buffer that can hold `capacity` items (minimum 1).
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1) as u64;
         Self {
@@ -17,22 +32,27 @@ impl<T: Copy + Default> Ring<T> {
         }
     }
 
+    /// Number of valid items currently stored.
     pub fn len(&self) -> u64 {
         self.abs_next - self.abs_base
     }
 
+    /// Whether the ring currently holds no samples.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Absolute index of the first valid item (inclusive).
     pub fn abs_base(&self) -> u64 {
         self.abs_base
     }
 
+    /// Absolute index of the next item to be pushed (exclusive).
     pub fn abs_next(&self) -> u64 {
         self.abs_next
     }
 
+    /// Append a slice, evicting older items if needed.
     pub fn push_slice(&mut self, xs: &[T]) {
         for &x in xs {
             let idx = (self.abs_next % self.cap) as usize;
@@ -93,6 +113,7 @@ impl<T: Copy + Default> Ring<T> {
         Some((a, b))
     }
 
+    /// Convenience helper that returns the requested window as a newly allocated `Vec`.
     pub fn get_vec(&self, start_abs: u64, len: usize) -> Option<Vec<T>> {
         let mut out = Vec::with_capacity(len);
         self.copy_into(start_abs, len, &mut out)?;

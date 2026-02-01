@@ -1,12 +1,28 @@
+//! SC-BLTC transmitter over TCP (raw I/Q streaming).
+//!
+//! This tool builds frames with [`sc_bltc::modem::ScBltcModem`], optionally applies a simulated
+//! channel (CFO/Doppler/multipath/AWGN), and streams complex baseband samples to a TCP receiver.
+//!
+//! Wire format:
+//! ```text
+//! handshake:
+//!   8  bytes  magic = "SCBLTC01"
+//!   4  bytes  u32 LE sample rate (Hz)
+//!   8  bytes  u64 LE t0_ns (Unix time for sample index 0)
+//! stream:
+//!   repeated complex samples:
+//!     4 bytes f32 LE real
+//!     4 bytes f32 LE imag
+//! ```
 use anyhow::Context;
 use clap::Parser;
 use num_complex::Complex32;
-use sc_bltc::channel::{
+use sc_bltc::modem::ScBltcModem;
+use sc_bltc::params::Params;
+use sc_bltc::sim::channel::{
     apply_channel_sample, build_random_multipath, normalize_taps, parse_mp_tap, ChannelState,
     DopplerOu, Gauss, MultipathFir, Rng64,
 };
-use sc_bltc::modem::ScBltcModem;
-use sc_bltc::params::Params;
 use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
@@ -15,10 +31,11 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// TCP stream magic for the toy I/Q transport.
 const MAGIC: &[u8; 8] = b"SCBLTC01";
 
 #[derive(Parser, Debug)]
-#[command(about = "SC-BLTC sender over TCP (no system audio stack)")]
+#[command(about = "SC-BLTC sender over TCP")]
 struct Args {
     /// Receiver address, e.g. 127.0.0.1:5555
     #[arg(long, default_value = "127.0.0.1:5555")]

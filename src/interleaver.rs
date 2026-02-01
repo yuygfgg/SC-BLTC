@@ -1,11 +1,19 @@
+//! Full-frame bit interleaver (Specification §3.A0).
+//!
+//! The polar codeword `B` (512 bits) is permuted with a fixed affine map:
+//! ```text
+//! b_int[j] = b[(A*j + B) mod 512]
+//! ```
+//! For `M=512=2^9`, choosing `A` odd guarantees the mapping is bijective.
+
+/// Number of coded bits per frame (`M` in the spec).
 pub const FRAME_BITS: usize = 512;
 
-// Full-frame bit interleaver permutation:
-//   b_int[j] = b[(A*j + B) mod FRAME_BITS]
-// with A odd so the mapping is bijective for FRAME_BITS=2^m.
+// Spec constants: A and B in pi(j) = (A*j + B) mod M.
 const A: usize = 109;
 const B: usize = 37;
 
+/// Build the inverse permutation table for `deinterleave_frame_llr`.
 const fn inv_map() -> [usize; FRAME_BITS] {
     let mut inv = [0usize; FRAME_BITS];
     let mut j = 0usize;
@@ -19,6 +27,7 @@ const fn inv_map() -> [usize; FRAME_BITS] {
 
 const INV: [usize; FRAME_BITS] = inv_map();
 
+/// Apply the interleaver permutation to a 512-bit codeword.
 pub fn interleave_frame_bits(bits: &[u8; FRAME_BITS]) -> [u8; FRAME_BITS] {
     let mut out = [0u8; FRAME_BITS];
     for (j, out_j) in out.iter_mut().enumerate() {
@@ -28,6 +37,7 @@ pub fn interleave_frame_bits(bits: &[u8; FRAME_BITS]) -> [u8; FRAME_BITS] {
     out
 }
 
+/// Apply the inverse permutation to deinterleave soft LLRs back to the polar decoder order.
 pub fn deinterleave_frame_llr(llr_int: &[f64; FRAME_BITS]) -> [f64; FRAME_BITS] {
     let mut out = [0f64; FRAME_BITS];
     for (i, out_i) in out.iter_mut().enumerate() {
