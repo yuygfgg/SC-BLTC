@@ -11,11 +11,11 @@ fn test_acquire_on_noise() {
     let key = [0u8; 32];
     let modem = ScBltcModem::new(p.clone(), key).unwrap();
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
 
     let n_ti = 1;
@@ -32,7 +32,7 @@ fn test_acquire_on_noise() {
         .collect();
 
     let result = modem
-        .acquire_fft_matched_window(&noise, 1000, n_ti, 1e-3, 3)
+        .acquire_fft_matched_window(&noise, 1000, n_ti, 3)
         .unwrap();
     assert!(result.is_none(), "false alarm: {result:?}");
 }
@@ -50,17 +50,17 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let frame = modem.build_frame_samples(b"t", 1, 1, Some(t_tx))?;
     let ti_tx = frame.ti_tx;
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
 
     let ti_min = ti_tx.saturating_sub(2);
     let n_ti = 5usize;
     let base = ((ti_tx - ti_min) as usize) * iv_samples;
-    let frac = t_tx - (ti_tx as f64) * p.iv_res_s;
+    let frac = t_tx - (ti_tx as f64) * p.iv_res_s();
     let n0 = (frac * fs).round() as usize % iv_samples;
     let pre = base + n0;
 
@@ -85,7 +85,7 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     }
 
     let acq = modem
-        .acquire_fft_raw_window(&raw, ti_min, n_ti, 1e-9, 3)?
+        .acquire_fft_raw_window(&raw, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}, ti_tx={ti_tx}");
@@ -142,7 +142,7 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
 //         .collect();
 
 //     let result = modem_b
-//         .acquire_fft_raw_window(&rx_noisy, ti_min, n_ti, 1e-3, 3)
+//         .acquire_fft_raw_window(&rx_noisy, ti_min, n_ti, 3)
 //         .unwrap();
 //     assert!(result.is_none(), "acquired with wrong key: {result:?}");
 // }

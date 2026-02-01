@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 /// TCP stream magic for the toy I/Q transport.
 const MAGIC: &[u8; 8] = b"SCBLTC01";
 
+/// Number of RAKE fingers to initialize from acquisition.
+const ACQ_N_FINGER: usize = 3;
+
 #[derive(Parser, Debug)]
 #[command(about = "SC-BLTC receiver over TCP")]
 struct Args {
@@ -34,10 +37,6 @@ struct Args {
     )]
     key_hex: String,
 
-    /// Load PHY parameters from a TOML file.
-    #[arg(long)]
-    params: Option<String>,
-
     /// CA-SCL list size for Polar decoding (higher = slower, usually better).
     #[arg(long, default_value_t = 16)]
     scl_list_size: usize,
@@ -45,14 +44,6 @@ struct Args {
     /// Blind acquisition time window W (seconds). Larger = slower.
     #[arg(long, default_value_t = 0.5)]
     w_sec: f64,
-
-    /// CFAR target false-alarm probability per hypothesis/FFT band.
-    #[arg(long, default_value_t = 1e-9)]
-    p_fa_total: f64,
-
-    /// Number of RAKE fingers to initialize from acquisition.
-    #[arg(long, default_value_t = 3)]
-    n_finger: usize,
 
     /// Ring buffer length in seconds (must be > frame length for continuous decode).
     #[arg(long, default_value_t = 30.0)]
@@ -146,22 +137,20 @@ struct Receiver {
 
 impl Receiver {
     fn new(args: Args) -> anyhow::Result<Self> {
-        let p = if let Some(path) = args.params.as_deref() {
-            Params::from_file(path)?
-        } else {
-            Params::default()
-        };
+        // Protocol parameters are fixed by the specification.
+        let p = Params::default();
         let key = parse_key_hex(&args.key_hex)?;
-        let modem = ScBltcModem::new(p.clone(), key)?;
+        let modem = ScBltcModem::new(p, key)?;
 
-        let fs = p.fs_hz as f64;
-        let iv_samples = ((p.fs_hz as f64) * p.iv_res_s).round() as u64;
+        let fs = p.fs_hz() as f64;
+        let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as u64;
         let l_sym = p.chip_samples() as u64;
-        let ell_last_pilot = 2u64 + 5u64 * (p.n_pilot.saturating_sub(1) as u64);
+        let ell_last_pilot = 2u64 + 5u64 * (p.n_pilot().saturating_sub(1) as u64);
         let last_pilot_end = (ell_last_pilot + 1) * l_sym;
         let pilot_timing_win: u64 = 32;
-        let rake_search_half_samples: u64 =
-            ((p.fs_hz as f64) * p.rake_search_half_s).round().max(0.0) as u64;
+        let rake_search_half_samples: u64 = ((p.fs_hz() as f64) * p.rake_search_half_s())
+            .round()
+            .max(0.0) as u64;
         let acq_guard_samples =
             last_pilot_end + pilot_timing_win + iv_samples + rake_search_half_samples;
         let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
@@ -226,11 +215,11 @@ impl Receiver {
         }
         let fs_hz = read_u32_le(stream).context("read fs_hz")?;
         let t0_ns = read_u64_le(stream).context("read t0_ns")?;
-        if fs_hz != self.p.fs_hz {
+        if fs_hz != self.p.fs_hz() {
             anyhow::bail!(
                 "fs mismatch: sender fs_hz={} but Params.fs_hz={}",
                 fs_hz,
-                self.p.fs_hz
+                self.p.fs_hz()
             );
         }
         eprintln!("[rx_tcp] handshake ok (fs={}Hz, t0_ns={})", fs_hz, t0_ns);
@@ -283,7 +272,7 @@ impl Receiver {
 
     fn push_samples(&mut self, raw: &[Complex32]) {
         self.signal.ring.push_slice(raw);
-        if !raw.is_empty() {
+        if self.args.debug && !raw.is_empty() {
             self.state.dbg.samp = self.state.dbg.samp.saturating_add(raw.len() as u64);
             let pwr: f64 = raw
                 .iter()
@@ -421,10 +410,10 @@ impl Receiver {
                 .abs_next()
                 .saturating_sub(self.state.acq_tail_samples)) as f64)
                 / self.state.fs;
-        let ti_latest_i = (t_latest / self.p.iv_res_s).floor() as i64;
+        let ti_latest_i = (t_latest / self.p.iv_res_s()).floor() as i64;
         let ti_earliest_i = ((t0 + (self.signal.ring.abs_base() as f64) / self.state.fs)
-            / self.p.iv_res_s)
-            .ceil() as i64;
+            / self.p.iv_res_s())
+        .ceil() as i64;
 
         let ti_latest = ti_latest_i.max(0) as u64;
         let mut ti_earliest = ti_earliest_i.max(0) as u64;
@@ -433,7 +422,7 @@ impl Receiver {
             return Ok(());
         }
 
-        let w_ti = ((self.args.w_sec / self.p.iv_res_s).ceil().max(1.0)) as u64;
+        let w_ti = ((self.args.w_sec / self.p.iv_res_s()).ceil().max(1.0)) as u64;
         let ti_floor = ti_latest.saturating_sub(w_ti);
         ti_earliest = ti_earliest.max(ti_floor);
 
@@ -469,7 +458,7 @@ impl Receiver {
             ti_end = ti_latest;
         }
 
-        let n_start_f = ((next_ti as f64) * self.p.iv_res_s - t0) * self.state.fs;
+        let n_start_f = ((next_ti as f64) * self.p.iv_res_s() - t0) * self.state.fs;
         let n_start = n_start_f.round().max(0.0) as u64;
 
         if n_start < self.signal.ring.abs_base() {
@@ -528,15 +517,12 @@ impl Receiver {
             );
         }
 
-        let backlog_before_s = (ti_latest.saturating_sub(next_ti) as f64) * self.p.iv_res_s;
+        let backlog_before_s = (ti_latest.saturating_sub(next_ti) as f64) * self.p.iv_res_s();
         let t_acq0 = Instant::now();
-        match self.modem.acquire_fft_raw_window(
-            y_win,
-            next_ti,
-            n_ti,
-            self.args.p_fa_total,
-            self.args.n_finger,
-        ) {
+        match self
+            .modem
+            .acquire_fft_raw_window(y_win, next_ti, n_ti, ACQ_N_FINGER)
+        {
             Ok(Some(acq)) => {
                 if self.state.acq.last_decoded_ti != Some(acq.ti_hat) {
                     let base_abs = n_start + (acq.ti_hat - next_ti) * self.state.iv_samples;
@@ -614,14 +600,14 @@ impl Receiver {
         }
         if self.args.debug {
             let elapsed_s = t_acq0.elapsed().as_secs_f64();
-            let span_s = (n_ti as f64) * self.p.iv_res_s;
+            let span_s = (n_ti as f64) * self.p.iv_res_s();
             let speed_x = if elapsed_s > 0.0 {
                 span_s / elapsed_s
             } else {
                 f64::INFINITY
             };
             let backlog_after_s =
-                (ti_latest.saturating_sub(ti_end.saturating_add(1)) as f64) * self.p.iv_res_s;
+                (ti_latest.saturating_sub(ti_end.saturating_add(1)) as f64) * self.p.iv_res_s();
             eprintln!(
                 "[rx_tcp][dbg] acq realtime: span={:.3}s, elapsed={:.3}s, speed={:.2}x, backlog={:.3}s -> {:.3}s",
                 span_s, elapsed_s, speed_x, backlog_before_s, backlog_after_s

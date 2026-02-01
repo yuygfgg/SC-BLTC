@@ -60,8 +60,8 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
     let modem = ScBltcModem::new(p.clone(), key)?;
 
     // Make t_tx land at n0=4 samples into the IV epoch (like the CLI example).
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let n0_true = 4usize;
     let t_tx = 4000.0f64 + (n0_true as f64) / fs; // within [0,1ms)
     let tx_frame = modem.build_frame_samples(b"test", 1, 1, Some(t_tx))?;
@@ -87,13 +87,13 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
 
     // Acquisition window must include all pilots for hybrid verification.
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq_win = &raw[..win_need];
     let acq = modem
-        .acquire_fft_raw_window(acq_win, ti_min, n_ti, 1e-9, 3)?
+        .acquire_fft_raw_window(acq_win, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     assert_eq!(acq.ti_hat, ti_tx);
@@ -121,8 +121,8 @@ fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
     let key = [0u8; 32];
     let modem = ScBltcModem::new(p.clone(), key)?;
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let n0_true = 4usize;
     let t_tx = 4000.0f64 + (n0_true as f64) / fs;
     let tx_frame = modem.build_frame_samples(b"test", 1, 1, Some(t_tx))?;
@@ -140,12 +140,12 @@ fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
     let raw = apply_ou_doppler_and_awgn(&raw, fs, 0.0, 1.0, 1.0, 0.0, 12345);
 
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
-        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     let (payload, meta) =
@@ -162,8 +162,8 @@ fn test_decode_awgn_only() -> anyhow::Result<()> {
     let key = [0u8; 32];
     let modem = ScBltcModem::new(p.clone(), key)?;
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let n0_true = 4usize;
     let t_tx = 4000.0f64 + (n0_true as f64) / fs;
     let tx_frame = modem.build_frame_samples(b"test", 1, 1, Some(t_tx))?;
@@ -181,12 +181,12 @@ fn test_decode_awgn_only() -> anyhow::Result<()> {
     let raw = apply_ou_doppler_and_awgn(&raw, fs, 0.0, 0.0, 1.0, 2.0, 12345);
 
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
-        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     let (payload, meta) =
@@ -203,8 +203,8 @@ fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
     let key = [0u8; 32];
     let modem = ScBltcModem::new(p.clone(), key)?;
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let n0_true = 4usize;
     let t_tx = 4000.0f64 + (n0_true as f64) / fs;
     let tx_frame = modem.build_frame_samples(b"test", 1, 1, Some(t_tx))?;
@@ -223,12 +223,12 @@ fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
     let raw = apply_ou_doppler_and_awgn(&raw, fs, cfo_hz, 0.0, 1.0, 0.0, 12345);
 
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
-        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     assert!((acq.cfo_hat_hz - cfo_hz).abs() < 1.0, "acq={acq:?}");
@@ -247,8 +247,8 @@ fn test_decode_with_constant_cfo_without_derotation() -> anyhow::Result<()> {
     let key = [0u8; 32];
     let modem = ScBltcModem::new(p.clone(), key)?;
 
-    let fs = p.fs_hz as f64;
-    let iv_samples = (fs * p.iv_res_s).round() as usize;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
     let n0_true = 4usize;
     let t_tx = 4000.0f64 + (n0_true as f64) / fs;
     let tx_frame = modem.build_frame_samples(b"test", 1, 1, Some(t_tx))?;
@@ -267,12 +267,12 @@ fn test_decode_with_constant_cfo_without_derotation() -> anyhow::Result<()> {
     let raw = apply_ou_doppler_and_awgn(&raw, fs, cfo_hz, 0.0, 1.0, 0.0, 12345);
 
     let l_sym = p.chip_samples();
-    let ell_last_pilot = 2 + 5 * (p.n_pilot - 1);
+    let ell_last_pilot = 2 + 5 * (p.n_pilot() - 1);
     let last_pilot_end = (ell_last_pilot + 1) * l_sym;
-    let rake_search_half = (fs * p.rake_search_half_s).round() as usize;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let win_need = n_ti * iv_samples + iv_samples + rake_search_half + last_pilot_end + 32;
     let acq = modem
-        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 1e-9, 3)?
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
     // Intentionally do NOT derotate with the coarse CFO estimate; force the symbol-rate loop

@@ -47,10 +47,6 @@ struct Args {
     )]
     key_hex: String,
 
-    /// Load PHY parameters from a TOML file.
-    #[arg(long)]
-    params: Option<String>,
-
     /// Protocol version (Header.Ver)
     #[arg(long, default_value_t = 1)]
     ver: u8,
@@ -318,13 +314,10 @@ struct Transmitter {
 
 impl Transmitter {
     fn new(args: Args) -> anyhow::Result<Self> {
-        let p = if let Some(path) = args.params.as_deref() {
-            Params::from_file(path)?
-        } else {
-            Params::default()
-        };
+        // Protocol parameters are fixed by the specification.
+        let p = Params::default();
         let key = parse_key_hex(&args.key_hex)?;
-        let modem = ScBltcModem::new(p.clone(), key)?;
+        let modem = ScBltcModem::new(p, key)?;
         Ok(Self { args, p, modem })
     }
 
@@ -342,15 +335,17 @@ impl Transmitter {
 
     fn write_handshake(&self, stream: &mut TcpStream) -> anyhow::Result<u64> {
         stream.write_all(MAGIC).context("write magic")?;
-        write_u32_le(stream, self.p.fs_hz).context("write fs_hz")?;
+        write_u32_le(stream, self.p.fs_hz()).context("write fs_hz")?;
         stream.flush().ok();
 
         eprintln!(
             "[tx_tcp] connected to {} (fs={}Hz), streaming I/Q f32 LE continuously (tcp_delay_ms={})",
-            self.args.addr, self.p.fs_hz, self.args.tcp_delay_ms
+            self.args.addr,
+            self.p.fs_hz(),
+            self.args.tcp_delay_ms
         );
 
-        let fs_u64 = self.p.fs_hz as u64;
+        let fs_u64 = self.p.fs_hz() as u64;
         let ts_ns = 1_000_000_000u64 / fs_u64;
         let now_ns = unix_now_ns_u64()?;
         let min_future_ns = now_ns.saturating_add(5_000_000);
@@ -439,12 +434,12 @@ impl Transmitter {
         let mut stream = self.connect_stream()?;
         let stream_t0_wall_ns = self.write_handshake(&mut stream)?;
 
-        let fs_nom_hz = self.p.fs_hz as f64;
+        let fs_nom_hz = self.p.fs_hz() as f64;
         let fs_actual_hz = fs_nom_hz * (1.0 + self.args.sro_ppm * 1e-6);
         if fs_actual_hz <= 0.0 {
             anyhow::bail!("fs_actual_hz must be positive (check --sro_ppm)");
         }
-        let iv_samples = (fs_nom_hz * self.p.iv_res_s).round() as u64;
+        let iv_samples = (fs_nom_hz * self.p.iv_res_s()).round() as u64;
 
         let mut tx = TcpDelay::new(stream, Duration::from_millis(self.args.tcp_delay_ms));
 
@@ -528,12 +523,12 @@ impl Transmitter {
             // Spec §4.B.1.
             let t_next_sample = stream_t0_wall + (n_sent as f64) / fs_actual_hz;
             let t_base = t_next_sample + self.args.gap_s.max(0.0);
-            let mut ti = (t_base / self.p.iv_res_s).floor() as u64 + 1;
+            let mut ti = (t_base / self.p.iv_res_s()).floor() as u64 + 1;
             let n_off = rng.next_u64() % iv_samples;
-            let mut t_frame = (ti as f64) * self.p.iv_res_s + (n_off as f64) / fs_nom_hz;
+            let mut t_frame = (ti as f64) * self.p.iv_res_s() + (n_off as f64) / fs_nom_hz;
             if t_frame < t_base {
                 ti += 1;
-                t_frame = (ti as f64) * self.p.iv_res_s + (n_off as f64) / fs_nom_hz;
+                t_frame = (ti as f64) * self.p.iv_res_s() + (n_off as f64) / fs_nom_hz;
             }
 
             let n_target = ((t_frame - stream_t0_wall) * fs_actual_hz).round() as i64;

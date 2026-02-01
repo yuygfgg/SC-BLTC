@@ -4,7 +4,8 @@
 //! - an acquired `ti_tx` (spreading seed)
 //! - a start sample index for the acquired IV epoch
 //! - one or more RAKE finger offsets within that epoch
-//! this module:
+//!
+//! This module:
 //! 1) generates the full-frame chip mask `C_seq`
 //! 2) samples chips for each finger with a DLL (early/late gate) and linear interpolation
 //! 3) runs a symbol-rate PLL/Costas loop with a small frequency bank (anti-slip)
@@ -116,9 +117,9 @@ impl<'a> SymbolTracker<'a> {
         cascade_delay: usize,
     ) -> anyhow::Result<Self> {
         let t_sym0 = Self::init_symbol_times(n_offset_total, n_finger, frame_start, cascade_delay);
-        let tsym = (p.sf as f64) / (p.rc_chip_sps as f64);
+        let tsym = (p.sf() as f64) / (p.rc_chip_sps() as f64);
         let dll = Self::init_dll(p, tsym);
-        let chip_step0 = dll.sym_step_samp / (p.sf as f64);
+        let chip_step0 = dll.sym_step_samp / (p.sf() as f64);
 
         let (u0_fingers, u1_fingers) = Self::sample_initial_fingers(
             y,
@@ -130,7 +131,7 @@ impl<'a> SymbolTracker<'a> {
             dll.sym_step_samp,
         )?;
         let pre_corr = Self::pre_corr(&u0_fingers, &u1_fingers);
-        let (theta, g) = Self::init_phase_and_channel(&pre_corr, p.n_pre, p.sf, n_finger);
+        let (theta, g) = Self::init_phase_and_channel(&pre_corr, p.n_pre(), p.sf(), n_finger);
         let w_mrc = Self::mrc_weights(&g);
 
         let (pll_kp, pll_ki, omega_lim) = Self::init_pll(tsym);
@@ -138,7 +139,7 @@ impl<'a> SymbolTracker<'a> {
 
         let (bank_dhz, bank_domega, bank_step_hz) = Self::init_freq_bank(tsym);
         let pre_mag_ref = Self::preamble_mag_ref(p, n_finger, &u0_fingers, &w_mrc, theta);
-        let alpha_ch = 1.0 / (p.n_pilot as f64);
+        let alpha_ch = 1.0 / (p.n_pilot() as f64);
 
         Ok(Self {
             p,
@@ -165,7 +166,7 @@ impl<'a> SymbolTracker<'a> {
             freq_snap_min_abs_hz: 0.75,
             alpha_ch,
             el_spacing_chips: 0.5,
-            buffers: SymbolBuffers::new(n_finger, p.sf),
+            buffers: SymbolBuffers::new(n_finger, p.sf()),
         })
     }
 
@@ -189,7 +190,7 @@ impl<'a> SymbolTracker<'a> {
 
     fn init_dll(p: &crate::params::Params, tsym: f64) -> EarlyLateDll {
         let dll_g = design_2nd_order_loop(0.6, 0.707, tsym);
-        let sym_step_nom = (p.sf as f64) * (p.osf as f64);
+        let sym_step_nom = (p.sf() as f64) * (p.osf() as f64);
         let sym_step_ppm = 2000.0;
         let sym_step_min = sym_step_nom * (1.0 - sym_step_ppm * 1e-6);
         let sym_step_max = sym_step_nom * (1.0 + sym_step_ppm * 1e-6);
@@ -215,16 +216,16 @@ impl<'a> SymbolTracker<'a> {
         let mut u0_fingers: FingerSamples = Vec::with_capacity(n_finger);
         let mut u1_fingers: FingerSamples = Vec::with_capacity(n_finger);
         for &t0 in t_sym0.iter().take(n_finger) {
-            let mut y0 = vec![Complex32::new(0.0, 0.0); p.sf];
+            let mut y0 = vec![Complex32::new(0.0, 0.0); p.sf()];
             Self::sample_symbol_into(y, t0, chip_step0, 0.0, &mut y0)
                 .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
-            Self::demask_in_place(c_seq, p.sf, 0, &mut y0);
+            Self::demask_in_place(c_seq, p.sf(), 0, &mut y0);
             u0_fingers.push(y0);
 
-            let mut y1 = vec![Complex32::new(0.0, 0.0); p.sf];
+            let mut y1 = vec![Complex32::new(0.0, 0.0); p.sf()];
             Self::sample_symbol_into(y, t0 + sym_step_nom, chip_step0, 0.0, &mut y1)
                 .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
-            Self::demask_in_place(c_seq, p.sf, 1, &mut y1);
+            Self::demask_in_place(c_seq, p.sf(), 1, &mut y1);
             u1_fingers.push(y1);
         }
         Ok((u0_fingers, u1_fingers))
@@ -303,10 +304,10 @@ impl<'a> SymbolTracker<'a> {
         w_mrc: &[Complex32],
         theta: f64,
     ) -> f32 {
-        let mut pre_u = vec![Complex32::new(0.0, 0.0); p.sf];
+        let mut pre_u = vec![Complex32::new(0.0, 0.0); p.sf()];
         let rot_theta0 = Complex32::from_polar(1.0, -(theta as f32));
         for i in 0..n_finger {
-            for j in 0..p.sf {
+            for j in 0..p.sf() {
                 pre_u[j] += w_mrc[i] * (u0_fingers[i][j] * rot_theta0);
             }
         }
@@ -396,12 +397,12 @@ impl<'a> SymbolTracker<'a> {
         q_data: &mut usize,
     ) -> anyhow::Result<()> {
         let p = self.p;
-        let chip_step = self.dll.sym_step_samp / (p.sf as f64);
+        let chip_step = self.dll.sym_step_samp / (p.sf() as f64);
         for i in 0..self.n_finger {
             let buf = &mut self.buffers.u_p_fingers[i];
             Self::sample_symbol_into(self.y, self.t_sym0[i], chip_step, 0.0, buf)
                 .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
-            Self::demask_in_place(self.c_seq, p.sf, ell, buf);
+            Self::demask_in_place(self.c_seq, p.sf(), ell, buf);
         }
 
         // Spec §3.D
@@ -413,7 +414,7 @@ impl<'a> SymbolTracker<'a> {
             }
         }
 
-        let outcome = if ell < p.n_pre || is_pilot(ell) {
+        let outcome = if ell < p.n_pre() || is_pilot(ell) {
             self.process_pilot_symbol(ell)
         } else {
             self.process_data_symbol(r_data_all, q_data)?
@@ -438,7 +439,7 @@ impl<'a> SymbolTracker<'a> {
         let kp = self.pll_kp;
         let ki = self.pll_ki;
         let omega_lim = self.omega_lim;
-        let sf = p.sf;
+        let sf = p.sf();
 
         let mut omega_used = self.omega;
         let mut best_dhz = 0.0f64;
@@ -450,7 +451,7 @@ impl<'a> SymbolTracker<'a> {
             Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.theta, omega_h);
 
             self.buffers.u_tmp.fill(Complex32::new(0.0, 0.0));
-            for j in 0..p.sf {
+            for j in 0..p.sf() {
                 let rotj = self.buffers.rot_tmp[j];
                 for i in 0..self.n_finger {
                     self.buffers.u_tmp[j] +=
@@ -483,7 +484,7 @@ impl<'a> SymbolTracker<'a> {
 
             Self::fill_rot_chips(&mut self.buffers.rot_best, sf, self.theta, omega_used);
             self.buffers.u_best.fill(Complex32::new(0.0, 0.0));
-            for j in 0..p.sf {
+            for j in 0..sf {
                 let rotj = self.buffers.rot_best[j];
                 for i in 0..self.n_finger {
                     self.buffers.u_best[j] +=
@@ -510,10 +511,10 @@ impl<'a> SymbolTracker<'a> {
         if is_pilot(ell) {
             for i in 0..self.n_finger {
                 let mut z_i = Complex32::new(0.0, 0.0);
-                for j in 0..p.sf {
+                for j in 0..p.sf() {
                     z_i += self.buffers.u_p_fingers[i][j] * self.buffers.rot_best[j];
                 }
-                let gi_meas = z_i / (p.sf as f32);
+                let gi_meas = z_i / (p.sf() as f32);
                 self.g[i] =
                     self.g[i] * (1.0 - self.alpha_ch as f32) + gi_meas * (self.alpha_ch as f32);
             }
@@ -536,8 +537,8 @@ impl<'a> SymbolTracker<'a> {
         let kp = self.pll_kp;
         let ki = self.pll_ki;
         let omega_lim = self.omega_lim;
-        let sf = p.sf;
-        let mw = p.mw;
+        let sf = p.sf();
+        let mw = p.mw();
 
         let mut omega_used = self.omega;
         let mut best_dhz = 0.0f64;
@@ -551,7 +552,7 @@ impl<'a> SymbolTracker<'a> {
             Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.theta, omega_h);
 
             self.buffers.u_tmp.fill(Complex32::new(0.0, 0.0));
-            for j in 0..p.sf {
+            for j in 0..p.sf() {
                 let rotj = self.buffers.rot_tmp[j];
                 for i in 0..self.n_finger {
                     self.buffers.u_tmp[j] +=
@@ -559,7 +560,7 @@ impl<'a> SymbolTracker<'a> {
                 }
             }
             self.buffers.r_tmp.clone_from(&self.buffers.u_tmp);
-            fht1024_in_place(&mut self.buffers.r_tmp);
+            fht1024_in_place(&mut self.buffers.r_tmp)?;
             let (i_h, conf_h) = Self::best_and_conf_mag(&self.buffers.r_tmp, mw);
             let m = self.buffers.r_tmp[i_h].norm_sqr();
             if m > best_v {
@@ -579,7 +580,7 @@ impl<'a> SymbolTracker<'a> {
         // Gate PLL/DD only on code confidence; freq_conf can be flat even when code is OK.
         let data_conf = best_code_conf;
 
-        let r256 = self.buffers.r_best[..p.mw].to_vec();
+        let r256 = self.buffers.r_best[..p.mw()].to_vec();
         r_data_all.push(r256);
 
         Self::pll_predict(&mut self.theta, omega_used);
@@ -677,9 +678,9 @@ impl<'a> SymbolTracker<'a> {
                 &mut self.buffers.tmp_l,
             )
             .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
-            Self::demask_in_place(self.c_seq, p.sf, ell, &mut self.buffers.tmp_e);
-            Self::demask_in_place(self.c_seq, p.sf, ell, &mut self.buffers.tmp_l);
-            for j in 0..p.sf {
+            Self::demask_in_place(self.c_seq, p.sf(), ell, &mut self.buffers.tmp_e);
+            Self::demask_in_place(self.c_seq, p.sf(), ell, &mut self.buffers.tmp_l);
+            for j in 0..p.sf() {
                 let rotj = self.buffers.rot_best[j];
                 self.buffers.u_e[j] += self.w_mrc[i] * (self.buffers.tmp_e[j] * rotj);
                 self.buffers.u_l[j] += self.w_mrc[i] * (self.buffers.tmp_l[j] * rotj);
@@ -692,10 +693,10 @@ impl<'a> SymbolTracker<'a> {
                 self.buffers.u_l.iter().copied().sum::<Complex32>(),
             )
         } else {
-            let wrow = walsh_row(update.m as u16, p.sf);
+            let wrow = walsh_row(update.m as u16, p.sf())?;
             let mut se = Complex32::new(0.0, 0.0);
             let mut sl = Complex32::new(0.0, 0.0);
-            for (j, &w) in wrow.iter().enumerate().take(p.sf) {
+            for (j, &w) in wrow.iter().enumerate().take(p.sf()) {
                 let wf = w as f32;
                 se += self.buffers.u_e[j] * wf;
                 sl += self.buffers.u_l[j] * wf;
@@ -733,7 +734,7 @@ impl ScBltcModem {
         let p = &self.p;
         let x_buf = if cfo_hz != 0.0 {
             let mut tmp = rx_samples.to_vec();
-            derotate_cfo_in_place(&mut tmp, p.fs_hz, cfo_hz);
+            derotate_cfo_in_place(&mut tmp, p.fs_hz(), cfo_hz);
             Some(tmp)
         } else {
             None
@@ -770,14 +771,14 @@ impl ScBltcModem {
 
         let y_buf = if cfo_hz != 0.0 {
             let mut tmp = y_matched.to_vec();
-            derotate_cfo_in_place(&mut tmp, p.fs_hz, cfo_hz);
+            derotate_cfo_in_place(&mut tmp, p.fs_hz(), cfo_hz);
             Some(tmp)
         } else {
             None
         };
         let y = y_buf.as_deref().unwrap_or(y_matched);
 
-        let c_seq = gen_code_aes_ctr(&self.key, ti_tx, p.frame_chips(), p.domain_u32);
+        let c_seq = gen_code_aes_ctr(&self.key, ti_tx, p.frame_chips(), p.domain_u32());
 
         let cascade_delay = 2 * self.rrc.delay();
         let frame_start = frame_start_sample as f64;
@@ -793,25 +794,25 @@ impl ScBltcModem {
             cascade_delay,
         )?;
 
-        let mut r_data_all: Vec<Vec<Complex32>> = Vec::with_capacity(p.n_data);
+        let mut r_data_all: Vec<Vec<Complex32>> = Vec::with_capacity(p.n_data());
         let mut q_data = 0usize;
-        for ell in 0..p.n_sym {
+        for ell in 0..p.n_sym() {
             tracker.process_symbol(ell, &mut r_data_all, &mut q_data)?;
         }
 
-        if q_data != p.n_data || r_data_all.len() != p.n_data {
+        if q_data != p.n_data() || r_data_all.len() != p.n_data() {
             return Ok((None, DecodeMeta::error("data_symbol_count_mismatch")));
         }
 
         // Spec §4.D.2–§4.D.3.
         let mut llr = [0f64; 512];
-        for q in 0..p.n_data {
+        for q in 0..p.n_data() {
             let d = &r_data_all[q];
-            for t in 0..p.k_bits_per_sym {
+            for t in 0..p.k_bits_per_sym() {
                 let mut m0 = f32::NEG_INFINITY;
                 let mut m1 = f32::NEG_INFINITY;
-                let shift = (p.k_bits_per_sym - 1 - t) as u16;
-                for (m, v) in d.iter().enumerate().take(p.mw) {
+                let shift = (p.k_bits_per_sym() - 1 - t) as u16;
+                for (m, v) in d.iter().enumerate().take(p.mw()) {
                     let bit = ((m as u16) >> shift) & 1;
                     let v = v.re;
                     if bit == 0 {
@@ -822,7 +823,7 @@ impl ScBltcModem {
                         m1 = v;
                     }
                 }
-                llr[q * p.k_bits_per_sym + t] = (m0 - m1) as f64;
+                llr[q * p.k_bits_per_sym() + t] = (m0 - m1) as f64;
             }
         }
         for v in &mut llr {

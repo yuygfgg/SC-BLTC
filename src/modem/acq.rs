@@ -135,11 +135,11 @@ impl ScBltcModem {
         matched: bool,
     ) -> anyhow::Result<Vec<Complex32>> {
         let p = &self.p;
-        if (ell + 1) * p.sf > c_seq.len() {
+        if (ell + 1) * p.sf() > c_seq.len() {
             anyhow::bail!("pilot ref build out of range");
         }
-        let chips = &c_seq[ell * p.sf..(ell + 1) * p.sf];
-        let x = pulse_shape_chips(chips, &self.rrc, p.osf as usize);
+        let chips = &c_seq[ell * p.sf()..(ell + 1) * p.sf()];
+        let x = pulse_shape_chips(chips, &self.rrc, p.osf() as usize);
         if matched {
             Ok(self.rrc.filter_same(&x))
         } else {
@@ -155,23 +155,24 @@ impl ScBltcModem {
         matched: bool,
     ) -> anyhow::Result<AcqContext> {
         let p = &self.p;
-        let iv_samples = ((p.fs_hz as f64) * p.iv_res_s).round() as usize;
+        let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as usize;
         if iv_samples == 0 {
             anyhow::bail!("invalid iv_samples");
         }
-        if p.rake_search_half_s < 0.0 {
+        if p.rake_search_half_s() < 0.0 {
             anyhow::bail!("invalid rake_search_half_s");
         }
-        let rake_search_half_samples = ((p.fs_hz as f64) * p.rake_search_half_s).round() as usize;
+        let rake_search_half_samples =
+            ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
 
         let l_sym = p.chip_samples();
-        let n_ref_pre = p.n_pre * l_sym;
+        let n_ref_pre = p.n_pre() * l_sym;
 
-        if p.nfft_acq < n_ref_pre {
+        if p.nfft_acq() < n_ref_pre {
             anyhow::bail!("Params.nfft_acq must be >= Npre*SF*OSF");
         }
 
-        let ell_last_pilot = 2 + 5 * (p.n_pilot.saturating_sub(1));
+        let ell_last_pilot = 2 + 5 * (p.n_pilot().saturating_sub(1));
         let last_pilot_end = (ell_last_pilot + 1) * l_sym;
         let pilot_timing_win: isize = 32;
         let verify_need = last_pilot_end + (pilot_timing_win as usize);
@@ -190,10 +191,10 @@ impl ScBltcModem {
             );
         }
 
-        let fs = p.fs_hz as f64;
-        let nfft = p.nfft_acq;
+        let fs = p.fs_hz() as f64;
+        let nfft = p.nfft_acq();
 
-        let search_hz = p.cfo_search_hz.abs().min(0.5 * fs);
+        let search_hz = p.cfo_search_hz().abs().min(0.5 * fs);
         let bin_max = ((search_hz * (nfft as f64)) / fs).floor() as isize;
         let bin_max = bin_max.clamp(1, (nfft as isize) / 2 - 1);
 
@@ -367,11 +368,11 @@ impl ScBltcModem {
             .map(|v| v.norm_sqr() as f64)
             .sum();
 
-        let c_seq_tmp = gen_code_aes_ctr(&self.key, ti_min, p.frame_chips(), p.domain_u32);
+        let c_seq_tmp = gen_code_aes_ctr(&self.key, ti_min, p.frame_chips(), p.domain_u32());
         let ref_sym_tmp = self.build_pilot_ref(&c_seq_tmp, 2, matched)?;
         let e_sym: f64 = ref_sym_tmp.iter().map(|v| v.norm_sqr() as f64).sum();
-        let e_total = e_pre + (p.n_pilot as f64) * e_sym;
-        let gamma = p.gamma_hybrid_mult * sigma2_hat * e_total;
+        let e_total = e_pre + (p.n_pilot() as f64) * e_sym;
+        let gamma = p.gamma_hybrid_mult() * sigma2_hat * e_total;
 
         let mut ti_needed: Vec<usize> = topk.iter().map(|c| (c.ti - ti_min) as usize).collect();
         ti_needed.sort_unstable();
@@ -380,9 +381,9 @@ impl ScBltcModem {
         let mut pilot_ref_conj_by_ti: Vec<Option<Vec<Vec<Complex32>>>> = vec![None; n_ti];
         for ti_idx in ti_needed {
             let ti = ti_min + (ti_idx as u64);
-            let c_seq = gen_code_aes_ctr(&self.key, ti, p.frame_chips(), p.domain_u32);
-            let mut pilots_this_ti: Vec<Vec<Complex32>> = Vec::with_capacity(p.n_pilot);
-            for r in 0..p.n_pilot {
+            let c_seq = gen_code_aes_ctr(&self.key, ti, p.frame_chips(), p.domain_u32());
+            let mut pilots_this_ti: Vec<Vec<Complex32>> = Vec::with_capacity(p.n_pilot());
+            for r in 0..p.n_pilot() {
                 let ell = 2 + 5 * r;
                 let ref_p = self.build_pilot_ref(&c_seq, ell, matched)?;
                 pilots_this_ti.push(ref_p.iter().map(|v| v.conj()).collect());
@@ -396,7 +397,7 @@ impl ScBltcModem {
         let fine_steps: i64 = (fine_span_hz / fine_step_hz).round() as i64;
 
         let delta_pos_by_pilot: Vec<usize> =
-            (0..p.n_pilot).map(|r| (2 + 5 * r) * ctx.l_sym).collect();
+            (0..p.n_pilot()).map(|r| (2 + 5 * r) * ctx.l_sym).collect();
 
         let best_final: Option<(Cand, f64, f64)> = topk
             .par_iter()
@@ -432,19 +433,19 @@ impl ScBltcModem {
                     let mut f_best = cand.f_hat;
                     for i in -fine_steps..=fine_steps {
                         let f = cand.f_hat + (i as f64) * fine_step_hz;
-                        let v = self.energy_of_seq_with_cfo(&y_pre[..], p.fs_hz, f);
+                        let v = self.energy_of_seq_with_cfo(&y_pre[..], p.fs_hz(), f);
                         if v > vpre_best {
                             vpre_best = v;
                             f_best = f;
                         }
                     }
 
-                    let fs_f32 = p.fs_hz as f32;
+                    let fs_f32 = p.fs_hz() as f32;
                     let dphi = -2.0 * std::f32::consts::PI * (f_best as f32) / fs_f32;
                     let w = Complex32::from_polar(1.0, dphi);
 
                     let mut vpil: f64 = 0.0;
-                    for r in 0..p.n_pilot {
+                    for r in 0..p.n_pilot() {
                         let refc = &pilots[r];
                         debug_assert_eq!(refc.len(), ctx.l_sym);
                         let delta_pos = delta_pos_by_pilot[r];
@@ -511,7 +512,7 @@ impl ScBltcModem {
         let ref_pre_conj = &ctx.ref_pre_conj_by_ti[best_ti_idx];
         let mut ref_pre_rot = vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre];
         {
-            let fs_f32 = p.fs_hz as f32;
+            let fs_f32 = p.fs_hz() as f32;
             let dphi = -2.0 * std::f32::consts::PI * (f_fine as f32) / fs_f32;
             let w = Complex32::from_polar(1.0, dphi);
             let mut ph = Complex32::new(1.0, 0.0);
@@ -565,7 +566,7 @@ impl ScBltcModem {
 
         let n0 = corr.first().map(|v| v.0).unwrap_or(best.off);
 
-        let min_sep = (p.osf as usize).max(1);
+        let min_sep = (p.osf() as usize).max(1);
         let mut finger_offsets: Vec<usize> = vec![n0];
         for (off, _) in &corr {
             if finger_offsets.iter().all(|&x| x.abs_diff(*off) >= min_sep) {
@@ -618,11 +619,8 @@ impl ScBltcModem {
         rx_raw_window: &[Complex32],
         ti_min: u64,
         n_ti: usize,
-        p_fa_total: f64,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
-        // `p_fa_total` is reserved for a future CFAR-style thresholding rule.
-        let _ = p_fa_total; // TODO
         self.acquire_fft_window_impl(rx_raw_window, ti_min, n_ti, n_finger, false)
     }
 
@@ -634,11 +632,8 @@ impl ScBltcModem {
         y_matched_window: &[Complex32],
         ti_min: u64,
         n_ti: usize,
-        p_fa_total: f64,
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
-        // `p_fa_total` is reserved for a future CFAR-style thresholding rule.
-        let _ = p_fa_total; // TODO
         self.acquire_fft_window_impl(y_matched_window, ti_min, n_ti, n_finger, true)
     }
 }

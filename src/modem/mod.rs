@@ -81,7 +81,9 @@ pub struct ScBltcModem {
     /// Protocol/PHY parameters.
     pub p: Params,
     /// Shared 256-bit key.
-    pub key: [u8; 32],
+    ///
+    /// Kept private to avoid accidental exposure via logs/debug output.
+    key: [u8; 32],
     /// RRC taps used for TX shaping and RX matched filtering.
     pub rrc: Fir,
     fft_acq: Arc<dyn Fft<f32>>,
@@ -95,12 +97,12 @@ impl ScBltcModem {
     /// - RRC taps
     /// - FFT plan/scratch size for acquisition
     pub fn new(p: Params, key: [u8; 32]) -> anyhow::Result<Self> {
-        if p.fs_hz != p.rc_chip_sps * p.osf {
+        if p.fs_hz() != p.rc_chip_sps() * p.osf() {
             anyhow::bail!("Params inconsistent: fs != rc*osf");
         }
-        let taps = rrc_taps(p.rrc_alpha, p.osf, p.rrc_span_symbols)?;
+        let taps = rrc_taps(p.rrc_alpha(), p.osf(), p.rrc_span_symbols())?;
         let mut planner = FftPlanner::<f32>::new();
-        let fft_acq = planner.plan_fft_forward(p.nfft_acq);
+        let fft_acq = planner.plan_fft_forward(p.nfft_acq());
         let fft_acq_scratch_len = fft_acq.get_inplace_scratch_len();
         Ok(Self {
             p,
