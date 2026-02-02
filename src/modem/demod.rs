@@ -85,7 +85,10 @@ struct SymbolTracker<'a> {
     y: &'a [Complex32],
     c_seq: &'a [i8],
     j_seq: &'a [usize],
+    f_seq_hz: &'a [f64],
     n_finger: usize,
+    // Integer sample delay relative to finger 0 (main path).
+    d_finger_samp: Vec<i32>,
     t_sym0: Vec<f64>,
     dll: EarlyLateDll,
     theta: f64,
@@ -106,6 +109,9 @@ struct SymbolTracker<'a> {
     freq_snap_min_abs_hz: f64,
     alpha_ch: f64,
     el_spacing_chips: f64,
+    // Spec §4.C: verification statistic for n0 refinement (preamble + pilots).
+    verify_pre: f64,
+    verify_pilot: f64,
     buffers: SymbolBuffers,
 }
 
@@ -129,9 +135,11 @@ impl<'a> SymbolTracker<'a> {
         y: &'a [Complex32],
         c_seq: &'a [i8],
         j_seq: &'a [usize],
+        f_seq_hz: &'a [f64],
         n_finger: usize,
         timing: TrackerTiming<'a>,
     ) -> anyhow::Result<Self> {
+        let d_finger_samp = Self::init_finger_delays_samp(timing.n_offset_total, n_finger);
         let t_sym0 = Self::init_symbol_times(
             timing.n_offset_total,
             n_finger,
@@ -146,7 +154,7 @@ impl<'a> SymbolTracker<'a> {
         let dll = Self::init_dll(p, t_update);
         let chip_step0 = dll.sym_step_samp / (p.sf() as f64);
 
-        let (u0_fingers, u1_fingers) = Self::sample_initial_fingers(
+        let (mut u0_fingers, mut u1_fingers) = Self::sample_initial_fingers(
             y,
             c_seq,
             p,
@@ -158,6 +166,18 @@ impl<'a> SymbolTracker<'a> {
                 sym_step_nom: dll.sym_step_samp,
             },
         )?;
+        let fs_hz = p.fs_hz() as f64;
+        if let Some(&f0) = f_seq_hz.first() {
+            Self::apply_hop_delay_phase_comp_in_place(&mut u0_fingers, f0, &d_finger_samp, fs_hz);
+        }
+        if f_seq_hz.len() >= 2 {
+            Self::apply_hop_delay_phase_comp_in_place(
+                &mut u1_fingers,
+                f_seq_hz[1],
+                &d_finger_samp,
+                fs_hz,
+            );
+        }
         let pre_corr = Self::pre_corr(&u0_fingers, &u1_fingers);
         let (theta, g) = Self::init_phase_and_channel(&pre_corr, p.n_pre(), p.sf(), n_finger);
         let w_mrc = Self::mrc_weights(&g);
@@ -168,13 +188,16 @@ impl<'a> SymbolTracker<'a> {
         let (bank_dhz, bank_domega, bank_step_hz) = Self::init_freq_bank(t_data);
         let pre_mag_ref = Self::preamble_mag_ref(p, n_finger, &u0_fingers, &w_mrc, theta);
         let alpha_ch = 1.0 / (p.n_pilot() as f64);
+        let verify_pre: f64 = pre_corr.iter().map(|z| z.norm_sqr() as f64).sum();
 
         Ok(Self {
             p,
             y,
             c_seq,
             j_seq,
+            f_seq_hz,
             n_finger,
+            d_finger_samp,
             t_sym0,
             dll,
             theta,
@@ -195,8 +218,56 @@ impl<'a> SymbolTracker<'a> {
             freq_snap_min_abs_hz: 0.75,
             alpha_ch,
             el_spacing_chips: 0.5,
+            verify_pre,
+            verify_pilot: 0.0,
             buffers: SymbolBuffers::new(n_finger, p.sf()),
         })
+    }
+
+    fn init_finger_delays_samp(n_offset_total: &[usize], n_finger: usize) -> Vec<i32> {
+        let n = n_finger.min(n_offset_total.len());
+        if n == 0 {
+            return Vec::new();
+        }
+        let n0 = n_offset_total[0] as i64;
+        (0..n)
+            .map(|i| (n_offset_total[i] as i64 - n0).clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+            .collect()
+    }
+
+    fn hop_delay_comp_phasor(f_hz: f64, d_samp: i32, fs_hz: f64) -> Complex32 {
+        if d_samp == 0 || f_hz == 0.0 || fs_hz == 0.0 {
+            return Complex32::new(1.0, 0.0);
+        }
+        let phi = 2.0 * std::f64::consts::PI * f_hz * (d_samp as f64) / fs_hz;
+        Complex32::from_polar(1.0, phi as f32)
+    }
+
+    fn apply_hop_delay_phase_comp_in_place(
+        fingers: &mut [FingerVec],
+        f_hz: f64,
+        d_finger_samp: &[i32],
+        fs_hz: f64,
+    ) {
+        for (i, chips) in fingers.iter_mut().enumerate() {
+            let d = d_finger_samp.get(i).copied().unwrap_or(0);
+            if d == 0 {
+                continue;
+            }
+            let rot = Self::hop_delay_comp_phasor(f_hz, d, fs_hz);
+            for v in chips {
+                *v *= rot;
+            }
+        }
+    }
+
+    fn verify_score(&self) -> f32 {
+        let v = self.verify_pre + self.verify_pilot;
+        if v.is_finite() && v >= 0.0 {
+            v as f32
+        } else {
+            0.0
+        }
     }
 
     fn mrc_weights(g_est: &[Complex32]) -> Vec<Complex32> {
@@ -450,6 +521,23 @@ impl<'a> SymbolTracker<'a> {
             }
         }
 
+        // Spec §4.C: hop-delay phase compensation per finger:
+        // u_{i,ell} *= exp(+j 2π f_ell Δd_i / Fs).
+        let f_hz = *self.f_seq_hz.get(ell).unwrap_or(&0.0);
+        if f_hz != 0.0 {
+            let fs_hz = p.fs_hz() as f64;
+            for i in 0..self.n_finger {
+                let d = self.d_finger_samp.get(i).copied().unwrap_or(0);
+                if d == 0 {
+                    continue;
+                }
+                let rot = Self::hop_delay_comp_phasor(f_hz, d, fs_hz);
+                for v in &mut self.buffers.u_p_fingers[i] {
+                    *v *= rot;
+                }
+            }
+        }
+
         let outcome = if ell < p.n_pre() || is_pilot(ell) {
             self.process_pilot_symbol(ell)
         } else {
@@ -537,6 +625,11 @@ impl<'a> SymbolTracker<'a> {
                 }
             }
             z_p = self.buffers.u_best.iter().copied().sum();
+        }
+
+        // Spec §4.C: accumulate pilot verification energy.
+        if is_pilot(ell) {
+            self.verify_pilot += z_p.norm_sqr() as f64;
         }
 
         let err = (z_p.im as f64).atan2((z_p.re as f64) + 1e-18);
@@ -743,6 +836,8 @@ impl<'a> SymbolTracker<'a> {
 
     fn update_dll(&mut self, ell: usize, chip_step: f64, update: DllUpdate) -> anyhow::Result<f64> {
         let p = self.p;
+        let f_hz = *self.f_seq_hz.get(ell).unwrap_or(&0.0);
+        let fs_hz = p.fs_hz() as f64;
         let el_shift = self.el_spacing_chips * chip_step;
         self.buffers.u_e.fill(Complex32::new(0.0, 0.0));
         self.buffers.u_l.fill(Complex32::new(0.0, 0.0));
@@ -765,10 +860,12 @@ impl<'a> SymbolTracker<'a> {
             .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
             Self::demask_in_place(self.c_seq, p.sf(), ell, &mut self.buffers.tmp_e);
             Self::demask_in_place(self.c_seq, p.sf(), ell, &mut self.buffers.tmp_l);
+            let d = self.d_finger_samp.get(i).copied().unwrap_or(0);
+            let rot_d = Self::hop_delay_comp_phasor(f_hz, d, fs_hz);
             for j in 0..p.sf() {
                 let rotj = self.buffers.rot_best[j];
-                self.buffers.u_e[j] += self.w_mrc[i] * (self.buffers.tmp_e[j] * rotj);
-                self.buffers.u_l[j] += self.w_mrc[i] * (self.buffers.tmp_l[j] * rotj);
+                self.buffers.u_e[j] += self.w_mrc[i] * ((self.buffers.tmp_e[j] * rot_d) * rotj);
+                self.buffers.u_l[j] += self.w_mrc[i] * ((self.buffers.tmp_l[j] * rot_d) * rotj);
             }
         }
 
@@ -854,7 +951,10 @@ impl ScBltcModem {
             deltas.push(d);
         }
 
-        let mut first_fail: Option<(Option<Vec<u8>>, DecodeMeta)> = None;
+        // Best-effort fallback when all deltas fail CRC: pick the Δn with the strongest
+        // preamble/pilots verification statistic (Spec §4.C).
+        let mut best_fail: Option<(Option<Vec<u8>>, DecodeMeta)> = None;
+        let mut best_score: f32 = f32::NEG_INFINITY;
         for delta in deltas {
             let mut offs_adj: Vec<usize> = Vec::with_capacity(n_offset_total.len());
             let mut ok = true;
@@ -917,12 +1017,18 @@ impl ScBltcModem {
             if meta.crc_ok {
                 return Ok((payload, meta));
             }
-            if first_fail.is_none() {
-                first_fail = Some((payload, meta));
+            let score = meta.verify_score;
+            let better = score.is_finite()
+                && (best_fail.is_none() || score > best_score || !best_score.is_finite());
+            if better {
+                best_score = score;
+                best_fail = Some((payload, meta));
+            } else if best_fail.is_none() {
+                best_fail = Some((payload, meta));
             }
         }
 
-        Ok(first_fail.unwrap_or((None, DecodeMeta::error("insufficient_samples"))))
+        Ok(best_fail.unwrap_or((None, DecodeMeta::error("insufficient_samples"))))
     }
 
     /// Spec §4.C–§4.D.
@@ -959,6 +1065,7 @@ impl ScBltcModem {
             },
         );
         let c_seq = g.c_seq;
+        let f_seq_hz = g.f_seq_hz;
         let j_seq = g.j_seq_chips;
 
         let cascade_delay = 2 * self.rrc.delay();
@@ -970,6 +1077,7 @@ impl ScBltcModem {
             y,
             &c_seq,
             &j_seq,
+            &f_seq_hz,
             n_finger,
             TrackerTiming {
                 n_offset_total,
@@ -989,6 +1097,8 @@ impl ScBltcModem {
             return Ok((None, DecodeMeta::error("data_symbol_count_mismatch")));
         }
 
+        let verify_score = tracker.verify_score();
+
         for v in &mut llr {
             *v = v.clamp(-1e6, 1e6);
         }
@@ -1001,6 +1111,7 @@ impl ScBltcModem {
             ver: hdr.ver,
             typ: hdr.typ,
             len: hdr.length,
+            verify_score,
             err: None,
         };
         if !crc_ok {

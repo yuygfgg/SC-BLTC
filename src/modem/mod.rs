@@ -59,6 +59,10 @@ pub struct DecodeMeta {
     pub typ: u8,
     /// Header.Len
     pub len: u8,
+    /// Verification statistic used for timing refinement fallback (larger is better).
+    ///
+    /// This is based on known-structure parts of the frame (preamble/pilots).
+    pub verify_score: f32,
     /// Optional error tag for early exits or malformed inputs.
     pub err: Option<&'static str>,
 }
@@ -71,6 +75,7 @@ impl DecodeMeta {
             ver: 0,
             typ: 0,
             len: 0,
+            verify_score: 0.0,
             err: Some(err),
         }
     }
