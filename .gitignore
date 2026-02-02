@@ -8,9 +8,6 @@ dist/
 *.jsonl
 target/
 
-# Github fails to render Latex, so we upload a PDF instead
-Specification.md
-
 # LaTeX build artifacts
 *.aux
 *.fdb_latexmk
@@ -18,6 +15,7 @@ Specification.md
 *.log
 *.out
 *.toc
+*.pdf
 
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md

@@ -30,16 +30,20 @@ The following global parameters are predefined:
 \item $M_W$ (Walsh Orthogonal Set Size): $M_W=2^k=256$ (256-ary orthogonal modulation).
 \item $R_{\text{sym}}$ (Spread Symbol Rate): $R_{\text{sym}}=R_c/\mathit{SF}=5000/1024\approx 4.88\,\text{sym/s}$.
 \item $R_{\text{bit}}$ (Post-spreading Bit Rate): $R_{\text{bit}}=k\cdot R_{\text{sym}}\approx 39.06\,\text{bps}$ (excluding preamble/pilot symbols and FEC overhead).
-\item $R_{\text{FEC}}$ (Polar Code Rate): Used for Forward Error Correction, fixed at $1/2$. The information rate is $R_{\text{info}} = R_{\text{bit}} \times R_{\text{FEC}}$ (excluding Header/CRC/padding overhead and preamble/pilot symbol overhead).
+\item $R_{\text{FEC}}$ (Polar Code Rate): Fixed at $1/2$. The information rate is $R_{\text{info}} = R_{\text{bit}} \times R_{\text{FEC}}$ (excluding Header/CRC/padding overhead and preamble/pilot symbol overhead).
 \item $K_{\text{sec}}$ (Shared Secret Key): A 256-bit key, pre-shared between the transmitter and receiver.
 \item $T_{\text{epoch}}$ (Time Epoch): Defined as the Unix Epoch (1970-01-01 00:00:00 UTC).
 \item $\mathit{IV}_{\text{res}}$ (Time Counter Resolution): Defines the time granularity for generating the spreading code seed, fixed at $1\,\text{ms}$.
-\item \textbf{TimeIndex Search Window}: The receiver searches $\mathit{TI}$ over a configured discrete window $\{\mathit{TI}_{\min},\mathit{TI}_{\min}+1,\dots,\mathit{TI}_{\min}+N_{\mathit{TI}}-1\}$. Protocol operation requires the transmitter's $\mathit{TI}_{\text{tx}}$ to lie inside this window.
+\item \textbf{TimeIndex Search Window}: The TimeIndex hypothesis set is
+  \[
+    \mathcal{T}=\{\mathit{TI}_{\min},\mathit{TI}_{\min}+1,\dots,\mathit{TI}_{\min}+N_{\mathit{TI}}-1\}.
+  \]
+  Protocol operation requires $\mathit{TI}_{\text{tx}}\in\mathcal{T}$.
 \item $M$ (FEC Codeword Length, coded bits): Fixed value $M=512$.
 \item $K$ (FEC Information Bit Length, uncoded bits): Fixed value $K=256$, satisfying $K=M\cdot R_{\text{FEC}}$.
 \item \textbf{FEC}: Uses an Arikan Polar code with $(N,K)=(512,256)$ and CRC-aided SCL (CA-SCL) decoding.
 \item \textbf{CRC}: A CRC-32C is appended inside $U$ and is used both for post-decoding verification and for CA-SCL list selection.
-\item \textbf{Number of Preamble Symbols}: Fixed at $N_{\text{pre}}=2$, used for acquisition and phase ambiguity resolution.
+\item \textbf{Number of Preamble Symbols}: Fixed at $N_{\text{pre}}=2$.
 \item \textbf{Number of Data Symbols}: $N_{\text{data}}=M/k=64$.
 \item \textbf{Number of Pilot Symbols}: Fixed at $N_{\text{pilot}}=16$. Pilot symbols use $W_0$ and are processed by the receiver's carrier/channel tracking and verification rules (Section~\ref{sec:receiver}).
 \item \textbf{Pilot Insertion Rule}: After the preamble, the $N_{\text{data}}$ data symbols are divided into $N_{\text{blk}}=16$ blocks of 4 symbols each. A pilot symbol is inserted at the beginning of each block. The structure of a single block is: \texttt{Pilot + Data + Data + Data + Data}.
@@ -58,8 +62,7 @@ The following global parameters are predefined:
   \[
     L_{\text{frame}}=\sum_{\ell=0}^{N_{\text{sym}}-1} (L_{\text{sym}} + j_\ell),
   \]
-  while the symbol count remains fixed at $N_{\text{sym}}=82$. The number of samples is $L_{\text{frame}}\cdot \mathit{OSF}$ (plus any optional tail padding used for filter decay).
-\item $E_b/N_0$ \textbf{Benchmark}: For a fixed $\mathit{SF}=1024$, using $k=8$ reduces the ``number of chips allocated per bit'', resulting in a $10\log_{10}(k)=9\,\text{dB}$ processing gain loss. The receiver employs $M_W$-way orthogonal Walsh matched filtering, which provides a $3\,\text{dB}$ equivalent advantage over binary decisions at the same $E_b/N_0$. The net change is a $6\,\text{dB}$ degradation.
+  while the symbol count remains fixed at $N_{\text{sym}}=82$. The number of samples is $L_{\text{frame}}\cdot \mathit{OSF}$ (plus optional tail padding, if present).
 \item \textbf{Walsh Code Definition}: Uses the row vectors $W_m[j]\in\{+1,-1\}$ of the order-$\mathit{SF}=1024$ Sylvester-Hadamard matrix, where
   \[
     W_m[j]=(-1)^{\mathrm{popcount}(m \mathbin{\&} j)\bmod 2},\quad m\in[0,1023],\; j\in[0,1023].
@@ -82,13 +85,31 @@ The following global parameters are predefined:
   \item Guard/noise chip power relative to data chips: $-3\,\text{dB}$.
   \item Guard soft-ramp length: $L_{\text{GI,ramp}}=8$ chips (capped by $j_\ell/2$ per symbol).
   \end{itemize}
-\item \textbf{Acquisition Parameters}:
+\item \textbf{Receiver Acquisition Parameters}:
   \begin{itemize}
   \item Acquisition FFT size: $N_{\text{FFT}}=32768$.
   \item CFO search half-bandwidth: $f_{\text{search}}=8000\,\text{Hz}$.
   \item Hybrid verification threshold multiplier: $\gamma_{\text{hyb}}=10$.
-  \item RAKE search half-window: $T_{\text{rake}}=4\,\text{ms}$.
-  \item Pilot timing verification window: $\pm 32$ samples.
+  \item Intra-epoch start-offset stride: $N_{\text{off,stride}}=4$ samples.
+  \item Fine-CFO grid: $\Delta f_{\text{fine}}=0.25\,\text{Hz}$ with $q\in\{-8,\dots,8\}$.
+  \item Timing-refinement half-window: $T_{\text{rake}}=4\,\text{ms}$ (equivalently $N_{\text{rake}}=\lfloor F_s T_{\text{rake}}\rfloor$ samples).
+  \item Pilot timing verification window: $N_{\text{pilot,win}}=32$ samples.
+  \item Requested RAKE-finger output count: $N_{\text{finger,req}}$ with
+    \[
+      N_{\text{finger,out}}=\min(\max(N_{\text{finger,req}},1),16).
+    \]
+  \end{itemize}
+\item \textbf{Receiver Tracking Parameters}:
+  \begin{itemize}
+  \item Numerical regularization: $\epsilon=10^{-18}$.
+  \item Post-acquisition frame-start refinement window: $N_{\Delta n}=6$ samples (i.e.\ $\Delta n\in[-6,6]$).
+  \item Maximum number of tracking/combining fingers: $N_{\text{finger,max}}=3$.
+  \item Carrier-tracking frequency bank: $\Delta f_h \in \{-4.0,-3.75,\dots,+4.0\}\,\text{Hz}$ with step $0.25\,\text{Hz}$.
+  \item Carrier-tracking frequency limit: $f_{\text{PLL,max}}=200\,\text{Hz}$.
+  \item Frequency-snap rule constants: $\mathrm{conf}_{\text{freq,min}}=0.15$, $f_{\text{snap,tol}}=0.125\,\text{Hz}$, $N_{\text{snap}}=3$, $f_{\text{snap,min}}=0.75\,\text{Hz}$.
+  \item Pilot cycle-slip magnitude threshold factor: $\eta_{\text{cs}}=0.25$ (threshold $|z_\ell|>\eta_{\text{cs}}M_{\text{pre}}$ on pilots).
+  \item Pilot-aided channel-gain smoothing factor: $\alpha_A=\frac{1}{16}$.
+  \item DLL early/late spacing: $0.5$ chips. DLL step limit: $\pm 2000\,\mathrm{ppm}$ around the nominal sample step.
   \end{itemize}
 \end{itemize}
 
@@ -116,7 +137,7 @@ AES-CTR mode is used as the Pseudo-Random Number Generator (PRNG).
 \begin{enumerate}
 \item \textbf{Construct Nonce/Counter}: Follows the standard CTR ``Nonce + Counter'' structure.
   \begin{itemize}
-  \item The 96-bit Nonce is defined as $\mathit{Nonce} = (\mathit{TimeIndex} \parallel \mathit{Domain})$, where $\mathit{TimeIndex}$ is 64-bit big-endian and $\mathit{Domain}$ is a 32-bit big-endian constant \texttt{0x424C5443} (ASCII for ``BLTC'') used for domain separation.
+  \item The 96-bit Nonce is defined as $\mathit{Nonce} = (\mathit{TimeIndex} \parallel \mathit{Domain})$, where $\mathit{TimeIndex}$ is 64-bit big-endian and $\mathit{Domain}$ is a 32-bit big-endian constant \texttt{0x424C5443} (ASCII for ``BLTC'').
   \item A 32-bit BlockCounter starts from 0 and increments for each block, forming the AES block input $\mathit{IV}_{\text{block}} = (\mathit{Nonce} \parallel \mathit{BlockCounter})$.
   \end{itemize}
 \item \textbf{AES-CTR Generation}: Encrypt an all-zero data stream to produce the keystream bytes.
@@ -143,7 +164,7 @@ AES-CTR mode is used as the Pseudo-Random Number Generator (PRNG).
         \end{cases}
         \quad (\text{chips}).
       \]
-      This yields $j_\ell\in[40,90]$.
+      Therefore $j_\ell\in[40,90]$.
     \end{itemize}
   \end{enumerate}
 \item \textbf{Endianness and Bit Order Convention}:
@@ -157,7 +178,7 @@ AES-CTR mode is used as the Pseudo-Random Number Generator (PRNG).
 
 \section{Transmitter Protocol}
 
-The transmitter derives $\mathit{TI}_{\text{tx}}$ from its local time source and emits a single frame. The receiver searches $\mathit{TI}$ over its configured window (Section~\ref{sec:receiver}).
+Each transmitted frame is parameterized by a TimeIndex $\mathit{TI}_{\text{tx}}=\left\lfloor t_{\text{tx}}/\mathit{IV}_{\text{res}}\right\rfloor$, where $t_{\text{tx}}$ is the transmitter local time at the start of the frame. Successful reception requires $\mathit{TI}_{\text{tx}}\in\mathcal{T}$ (Section~\ref{sec:receiver}).
 
 \subsection{Step A0: Frame Format}
 
@@ -193,14 +214,14 @@ This protocol uses a fixed \textbf{symbol count} per frame ($N_{\text{sym}}=82$)
       w(i) = \sum_{j=0}^{\log_2 N - 1} b_j(i)\,\beta^j,\quad b_j(i)\in\{0,1\} \text{ is bit } j \text{ of } i.
     \]
     The $K$ indices with the largest $w(i)$ form the information set; all other indices are frozen.
-  \item Apply the standard Arikan Polar transform to obtain the codeword $\mathbf{B}=\{b_0,\dots,b_{N-1}\}$.
+  \item The codeword $\mathbf{B}=\{b_0,\dots,b_{N-1}\}$ is defined by the standard Arikan Polar transform applied to $\mathbf{u}$.
   \end{enumerate}
 
-\item \textbf{Full-Frame Interleaving}: Apply a fixed bit permutation $\pi(\cdot)$ over the full codeword to produce an interleaved sequence $B^{(\pi)}=\{b^{(\pi)}_0,\dots,b^{(\pi)}_{M-1}\}$:
+\item \textbf{Full-Frame Interleaving}: The interleaved sequence $B^{(\pi)}=\{b^{(\pi)}_0,\dots,b^{(\pi)}_{M-1}\}$ is defined by the permutation $\pi(\cdot)$ over the full codeword:
   \[
     b^{(\pi)}_j = b_{\pi(j)},\quad \pi(j) = (A\cdot j + B)\bmod M,\quad A=109,\; B=37.
   \]
-  For $M=2^9$, any odd $A$ yields a bijection; $A=109$ is odd.
+  For $M=2^9$ with odd $A$, $\pi(\cdot)$ is a bijection.
 
 \item \textbf{Symbol Mapping (256-ary Walsh)}: $B^{(\pi)}$ is grouped into $N_{\text{data}}=64$ symbol indices $m_q\in[0,255]$ of $k=8$ bits each (MSB first):
   \[
@@ -226,15 +247,14 @@ This protocol uses a fixed \textbf{symbol count} per frame ($N_{\text{sym}}=82$)
 
 \subsection{Step A: Payload Preparation}
 
-Assemble the frame according to Step A0 to get the fixed-length information bits $U$ (including CRC and padding). Perform Polar encoding on $U$ to get the codeword bit sequence $B=\{b_0,\dots,b_{M-1}\}$. Apply the full-frame interleaver to get $B^{(\pi)}$, and pack it into a sequence of symbol indices $\{m_0,\dots,m_{N_{\text{data}}-1}\}$ using $k=8$ bits per symbol.
+The mapping from (\texttt{Header}, \texttt{Payload}) to $\{m_q\}_{q=0}^{N_{\text{data}}-1}$ is defined by Step~A0.
 
 \subsection{Step B: Determine Transmission Time Seed}
 
-Read the current local time $t_{\text{tx}}$. Calculate the time counter:
+The TimeIndex is defined by
 \[
   \mathit{TI}_{\text{tx}} = \left\lfloor \frac{t_{\text{tx}}}{\mathit{IV}_{\text{res}}} \right\rfloor.
 \]
-The receiver estimates $\mathit{TI}_{\text{tx}}$ via blind acquisition (Section~\ref{sec:receiver}).
 
 \subsection{Step C: Generate Full-Frame Spreading Code}
 
@@ -267,13 +287,13 @@ The chips for the $\ell$-th spread symbol ($\ell=0,\dots,N_{\text{sym}}-1$) are 
       S[1\cdot \mathit{SF} + j] = -C_{\text{seq}}[1\cdot \mathit{SF} + j].
     \]
   \end{itemize}
-  These two preamble symbols are used for acquisition and phase ambiguity resolution and do not carry information bits.
+  These two preamble symbols do not carry information bits.
 
 \item \textbf{Pilot Symbols} ($\ell=\ell_{\text{pilot}}(r)$, $r=0,\dots,15$): Fixed to use $W_0[j]\equiv +1$:
   \[
     S[\ell\cdot \mathit{SF} + j] = C_{\text{seq}}[\ell\cdot \mathit{SF} + j].
   \]
-  Pilot symbols are used for continuous phase tracking and cycle slip suppression and do not carry information bits.
+  Pilot symbols do not carry information bits.
 
 \item \textbf{Data Symbols} ($\ell=\ell_{\text{data}}(q)$, $q=0,\dots,N_{\text{data}}-1$): Uses the $m_q$-th Walsh row. Let $\ell=\ell_{\text{data}}(q)$:
   \[
@@ -284,41 +304,56 @@ The chips for the $\ell$-th spread symbol ($\ell=0,\dots,N_{\text{sym}}-1$) are 
 
 \subsection{Step D1.5: Guard Interval Insertion and Noise Filling}
 
-After the $\ell$-th spread symbol's $1024$ data chips, append a length-$j_\ell$ guard/noise segment:
+For each spread symbol $\ell$, define the transmitted chip segment as the concatenation of the information-bearing chips and a guard/noise segment:
+\[
+  \{S[\ell\cdot \mathit{SF}+j]\}_{j=0}^{\mathit{SF}-1}\ \parallel\ \{G_\ell[k]\}_{k=0}^{j_\ell-1}.
+\]
 
-\begin{enumerate}
-\item \textbf{Data Segment}: Send the $\mathit{SF}=1024$ chips defined in Step D.
-\item \textbf{Guard/Noise Segment}: Immediately follow with $j_\ell$ real-valued chips of zero-mean Gaussian noise.
-  \begin{itemize}
-  \item Noise power relative to the unit-power data chips is fixed to $-3\,\text{dB}$, i.e.\ $\sigma^2 = 10^{-3/10}$ and $\sigma=\sqrt{10^{-3/10}}$.
-  \item This segment is not Walsh-spread and carries no information.
-  \item The guard/noise chips are generated deterministically per frame and per symbol:
-    \begin{enumerate}
-    \item Seed:
-      \[
-        s_{\ell,0}=\left(\mathit{TI}_{\text{tx}} \oplus (\ell\ll 32) \oplus \texttt{0xA7F031D359B29C11}\right)\oplus \texttt{0x9E3779B97F4A7C15}.
-      \]
-    \item PRNG core (xorshift64*): with state $s$,
-      \[
-        x \leftarrow s;\ \ x\leftarrow x\oplus(x\gg 12);\ \ x\leftarrow x\oplus(x\ll 25);\ \ x\leftarrow x\oplus(x\gg 27);\ \ s\leftarrow x;\ \ u_{64}\leftarrow x\cdot \texttt{0x2545F4914F6CDD1D}.
-      \]
-    \item Convert to uniforms in $(0,1)$:
-      \[
-        u = \frac{(u_{64}\gg 40)+1}{2^{24}+2}.
-      \]
-    \item Box-Muller: draw $(u_1,u_2)$ and compute
-      \[
-        z_0=\sqrt{-2\ln(\max(u_1,10^{-12}))}\cos(2\pi u_2),\quad
-        z_1=\sqrt{-2\ln(\max(u_1,10^{-12}))}\sin(2\pi u_2).
-      \]
-      The generator outputs $z_0,z_1$ alternately and scales by $\sigma$.
-    \end{enumerate}
-  \item Guard soft ramp: let $r_\ell=\min(L_{\text{GI,ramp}},\lfloor j_\ell/2\rfloor)$. If $r_\ell\ge 2$, multiply the first $r_\ell$ and last $r_\ell$ guard chips by the half-cosine window
-    \[
-      w_{\text{GI}}[k]=\frac{1}{2}\left(1-\cos\left(\pi\frac{k}{r_\ell-1}\right)\right),\quad k=0,\dots,r_\ell-1.
-    \]
-  \end{itemize}
-\end{enumerate}
+The guard/noise segment is defined as a deterministic real-valued sequence with variance $\sigma^2=10^{-3/10}$ (i.e.\ $\sigma=\sqrt{10^{-3/10}}$). Let $z_{\ell}[k]\sim\mathcal{N}(0,1)$ denote a standard-normal sequence defined by the PRNG mapping below, and define a soft-ramp window $w_{\text{GI},\ell}[k]\in[0,1]$ by:
+\[
+  r_\ell=\min\!\left(L_{\text{GI,ramp}},\left\lfloor \frac{j_\ell}{2}\right\rfloor\right),
+\]
+\[
+  w_{\text{ramp}}[k]=\frac{1}{2}\left(1-\cos\left(\pi\frac{k}{r_\ell-1}\right)\right),\quad k=0,\dots,r_\ell-1,
+\]
+and
+\[
+  w_{\text{GI},\ell}[k]=
+  \begin{cases}
+  1 & r_\ell<2\\
+  w_{\text{ramp}}[k] & r_\ell\ge 2\ \wedge\ 0\le k<r_\ell\\
+  1 & r_\ell\ge 2\ \wedge\ r_\ell\le k<j_\ell-r_\ell\\
+  w_{\text{ramp}}[j_\ell-1-k] & r_\ell\ge 2\ \wedge\ j_\ell-r_\ell\le k<j_\ell
+  \end{cases}.
+\]
+The guard/noise chips are
+\[
+  G_\ell[k]=\sigma\cdot w_{\text{GI},\ell}[k]\cdot z_\ell[k],\quad k=0,\dots,j_\ell-1.
+\]
+
+\paragraph{Deterministic Normal Sequence Definition}
+Define the 64-bit seed
+\[
+  s_{\ell,0}=\left(\mathit{TI}_{\text{tx}} \oplus (\ell\ll 32) \oplus \texttt{0xA7F031D359B29C11}\right)\oplus \texttt{0x9E3779B97F4A7C15}.
+\]
+Define the xorshift64* state recursion on 64-bit words (all operations modulo $2^{64}$):
+\[
+  x_{\ell,n,0}=s_{\ell,n},\quad x_{\ell,n,1}=x_{\ell,n,0}\oplus (x_{\ell,n,0}\gg 12),\quad x_{\ell,n,2}=x_{\ell,n,1}\oplus (x_{\ell,n,1}\ll 25),
+\]
+\[
+  x_{\ell,n,3}=x_{\ell,n,2}\oplus (x_{\ell,n,2}\gg 27),\quad s_{\ell,n+1}=x_{\ell,n,3},\quad u_{64,\ell}[n]=x_{\ell,n,3}\cdot \texttt{0x2545F4914F6CDD1D}.
+\]
+Define the uniform sequence $u_\ell[n]\in(0,1)$ by
+\[
+  u_\ell[n]=\frac{(u_{64,\ell}[n]\gg 40)+1}{2^{24}+2}.
+\]
+Define the standard-normal sequence $z_\ell[k]$ by pairing uniforms $(u_\ell[2m],u_\ell[2m+1])$:
+\[
+  z_\ell[2m]=\sqrt{-2\ln(\max(u_\ell[2m],10^{-12}))}\cos(2\pi u_\ell[2m+1]),
+\]
+\[
+  z_\ell[2m+1]=\sqrt{-2\ln(\max(u_\ell[2m],10^{-12}))}\sin(2\pi u_\ell[2m+1]).
+\]
 
 \subsection{Step D2: Pulse Shaping and Oversampling}
 
@@ -328,7 +363,7 @@ The baseband chip sequence is pulse-shaped.
 \item \textbf{Oversampling}: The shaped waveform is output at a sampling rate of $F_s = \mathit{OSF} \cdot R_c$.
 \end{itemize}
 
-Let $S_{\text{base}}[n]$ be the RRC-shaped complex baseband waveform at the sampling rate, generated from the chip stream that includes both the data segments and the guard/noise segments. Its length is $L_{\text{frame}}\cdot \mathit{OSF}$ (plus any optional tail padding used for filter decay).
+Let $S_{\text{base}}[n]$ be the RRC-shaped complex baseband waveform at the sampling rate, generated from the chip stream that includes both the data segments and the guard/noise segments. Its length is $L_{\text{frame}}\cdot \mathit{OSF}$ (plus optional tail padding, if present).
 
 RRC pulse shaping is applied before digital frequency rotation (Step D3). The filter taps are generated by the standard continuous-time RRC closed form sampled at $1/F_s$ and normalized to unit energy:
 
@@ -352,9 +387,9 @@ RRC pulse shaping is applied before digital frequency rotation (Step D3). The fi
       h\!\left(\pm\frac{1}{4a}\right)=\frac{a}{\sqrt{2}}\left[\left(1+\frac{2}{\pi}\right)\sin\!\left(\frac{\pi}{4a}\right)+\left(1-\frac{2}{\pi}\right)\cos\!\left(\frac{\pi}{4a}\right)\right].
     \]
   \end{itemize}
-\item Sample the taps as $h[i]=h(t_i)$ and normalize to unit energy:
+\item Define the sampled taps $\tilde h[i]=h(t_i)$ and the unit-energy normalized taps
   \[
-    h[i]\leftarrow \frac{h[i]}{\sqrt{\sum_{k=0}^{L_{\text{rrc}}-1} h[k]^2}}.
+    h[i]=\frac{\tilde h[i]}{\sqrt{\sum_{k=0}^{L_{\text{rrc}}-1} \tilde h[k]^2}}.
   \]
 \end{itemize}
 
@@ -373,15 +408,17 @@ Let $f_\ell$ be the hop offset for symbol $\ell$ (from $F_{\text{seq}}$). Define
 \]
 For samples $n$ that fall within the $\ell$-th symbol's \textbf{time span} (including its guard/noise segment), update:
 \[
+  \Phi[-1]=0.
+\]
+\[
   \Phi[n] = \Phi[n-1] + \Delta\omega_\ell.
 \]
 Transmit waveform:
 \[
   S_{\text{tx}}[n] = S_{\text{base}}[n]\cdot e^{j\Phi[n]}.
 \]
-\begin{quote}
-\textbf{Important (Phase Continuity)}: $\Phi[n]$ must remain cumulative across symbol boundaries (do not reset at symbol transitions). This ensures smooth time-domain transitions at hop changes and strongly suppresses spectral splatter.
-\end{quote}
+\paragraph{Phase Continuity}
+The phase process $\Phi[n]$ is continuous across symbol boundaries.
 
 \subsection{Step E: Transmission}
 
@@ -395,446 +432,541 @@ This specification defines the complex baseband waveform $S_{\text{tx}}[n]$ at s
   \[
     w_{\text{tx}}[i]=\frac{1}{2}\left(1+\cos\left(\pi\frac{i}{L_{\text{ramp}}-1}\right)\right),\quad i=0,\dots,L_{\text{ramp}}-1,
   \]
-  applied as $S_{\text{tx}}[N-L_{\text{ramp}}+i]\leftarrow S_{\text{tx}}[N-L_{\text{ramp}}+i]\cdot w_{\text{tx}}[i]$.
+  and define the ramped transmit sequence by $S_{\text{tx}}^{(\text{ramp})}[n]=S_{\text{tx}}[n]$ for $n<N-L_{\text{ramp}}$ and $S_{\text{tx}}^{(\text{ramp})}[N-L_{\text{ramp}}+i]=S_{\text{tx}}[N-L_{\text{ramp}}+i]\cdot w_{\text{tx}}[i]$.
 \end{enumerate}
 
 \section{Receiver Protocol}\label{sec:receiver}
 
-The receiver does not know $\mathit{TI}_{\text{tx}}$ and searches over a configured window $\{\mathit{TI}_{\min},\dots,\mathit{TI}_{\min}+N_{\mathit{TI}}-1\}$. If this window is derived from a local-time estimate $t_{\text{rx}}$ and an uncertainty bound $W$, compute:
+The receiver input is a continuous complex baseband sample sequence $x[n]$ at sampling rate $F_s$.
+
+The TimeIndex hypothesis set is $\mathcal{T}=\{\mathit{TI}_{\min},\dots,\mathit{TI}_{\min}+N_{\mathit{TI}}-1\}$. If $\mathit{TI}_{\min}$ and $N_{\mathit{TI}}$ are derived from a local-time estimate $t_{\text{rx}}$ and an uncertainty bound $W$, then
 \[
   \mathit{TI}_{\min}=\left\lfloor \frac{t_{\text{rx}}-W}{\mathit{IV}_{\text{res}}}\right\rfloor,\quad
   N_{\mathit{TI}}=\left\lfloor \frac{t_{\text{rx}}+W}{\mathit{IV}_{\text{res}}}\right\rfloor-\mathit{TI}_{\min}+1.
 \]
 
-\subsection{Step A: Signal Buffering}
+\subsection{Step A: Input Samples}
 
-The receiver continuously records the signal into a circular buffer \texttt{Buffer}.
+All receiver processing is defined on subsequences of $x[n]$. Buffering and RF front-end implementation details are outside the scope of this document.
 
-\subsection{Step B: Blind Acquisition (De-hopping + FFT)}
+\subsection{Step B: Blind Acquisition}
 
-Acquisition is performed under a $\mathit{TI}$ hypothesis and reconstructs the corresponding hop/guard structure from \texttt{GenCode}.
-
-\begin{quote}
-The receiver first down-converts the signal to complex baseband I/Q. The acquisition stage operates directly on these \textbf{raw baseband samples}.
-\end{quote}
-
-\subsubsection{4.B.1 Search Space Definition}
-\begin{itemize}
-\item \textbf{Time Hypothesis}: Iterate $\mathit{TI}_{\text{search}} \in \{\mathit{TI}_{\min},\dots,\mathit{TI}_{\min}+N_{\mathit{TI}}-1\}$.
-\item \textbf{Intra-Epoch Starting Offset}: Define $N_{\text{IV,samp}}=\mathrm{round}(F_s\cdot \mathit{IV}_{\text{res}})$. Coarse acquisition evaluates offsets on a fixed stride of 4 samples, i.e.\ $n_{\text{offset,total}} \in \{0,4,8,\dots\}<N_{\text{IV,samp}}$. The final RAKE timing refinement (4.B.2 Step 6) evaluates a contiguous sample-level window.
-\item \textbf{Residual Frequency Offset Search}: Use an FFT peak search within $|\Delta f|\le f_{\text{search}}$, with $f_{\text{search}}=8000\,\text{Hz}$.
-\end{itemize}
-
-\subsubsection{4.B.2 Algorithm Outline}
-
-For each $\mathit{TI}_{\text{search}}$:
-\begin{enumerate}
-\item \textbf{Generate Schedules}:
-  \[
-    (C_{\text{seq}}, F_{\text{seq}}, J_{\text{seq}})=\texttt{GenCode}(K_{\text{sec}}, \mathit{TI}_{\text{search}}, N_{\text{sym}}).
-  \]
-\item \textbf{Compute Symbol Start Positions}: Using $J_{\text{seq}}$, compute the symbol start positions (in samples) relative to the frame start:
-  \[
-    n_\ell = \left(\sum_{k=0}^{\ell-1} (\mathit{SF}+j_k)\right)\cdot \mathit{OSF}.
-  \]
-\item \textbf{De-hopping Rotation (Time-Frequency Grid Reconstruction)}: Construct a de-hopping phasor whose instantaneous frequency follows the hop sequence and remains phase-continuous:
-  \[
-    D[n]=e^{-j\Phi[n]},\quad \Phi[n]=\Phi[n-1]+2\pi\frac{f_\ell}{F_s},
-  \]
-  for samples $n$ within symbol $\ell$'s time span (data + guard/noise).
-\item \textbf{Preamble FFT Detection}: For each start-offset hypothesis $n_{\text{offset,total}}$, extract a window covering \textbf{both} preamble symbols' \textbf{data segments} and coherently accumulate them for the coarse FFT score. Concretely, form a sparse window
-  \[
-    y[n]=
-    \begin{cases}
-    x[n]\cdot s_0^*[n] & n\in[0, \mathit{SF}\cdot\mathit{OSF}) \\
-    0 & n\in[\mathit{SF}\cdot\mathit{OSF}, (\mathit{SF}+j_0)\cdot\mathit{OSF}) \\
-    x[n]\cdot s_1^*[n-(\mathit{SF}+j_0)\cdot\mathit{OSF}] & n\in[(\mathit{SF}+j_0)\cdot\mathit{OSF}, (2\mathit{SF}+j_0)\cdot\mathit{OSF})
-    \end{cases}
-  \]
-  where $s_0,s_1$ are the locally generated (hopped) TX-shaped preamble references for symbol 0 and 1 (with the Barker-2 sign pattern $+W_0,-W_0$) and the hop phasor is phase-continuous across the symbol boundary. Concretely, if symbol 0 uses hop $f_0$ and the time between the two preamble symbol starts is $\Delta n_1=(\mathit{SF}+j_0)\cdot\mathit{OSF}$ samples, then the symbol-1 reference includes the accumulated phase factor $e^{+j2\pi f_0\Delta n_1/F_s}$ at its start.
-
-  The receiver pads $y[n]$ to $N_{\text{FFT}}=32768$ and computes an FFT. Let $Y[k]$ be the FFT output. Define the bin limit
-  \[
-    k_{\max}=\left\lfloor \frac{\min(f_{\text{search}},F_s/2)\,N_{\text{FFT}}}{F_s}\right\rfloor, \quad k_{\max}\in[1,N_{\text{FFT}}/2-1].
-  \]
-  The coarse CFO bin is selected by maximizing power over bins $k\in\{0,1,\dots,k_{\max}\}\cup\{N_{\text{FFT}}-k_{\max},\dots,N_{\text{FFT}}-1\}$:
-  \[
-    k_0=\arg\max_k |Y[k]|^2.
-  \]
-  The selected bin is mapped to a signed bin index $b_0\in[-k_{\max},k_{\max}]$ (with negative frequencies represented by the upper FFT bins). A quadratic interpolation refines the bin location when $|b_0|<k_{\max}$:
-  \[
-    \delta = \frac{1}{2}\frac{P_{-1}-P_{+1}}{P_{-1}-2P_0+P_{+1}},\quad b=b_0+\delta,
-  \]
-  where $P_{-1}=|Y[b_0-1]|^2$, $P_0=|Y[b_0]|^2$, $P_{+1}=|Y[b_0+1]|^2$ using circular indexing on the FFT output. The coarse CFO estimate is
-  \[
-    \widehat{\Delta f}_{\text{coarse}} = b\cdot \frac{F_s}{N_{\text{FFT}}}.
-  \]
-
-\item \textbf{Verification Using Pilots}: For top candidates, refine CFO on a small grid and verify using noncoherent pilot energy. Pilot symbol positions are computed using $n_\ell$, and the receiver integrates only over each pilot's $1024$-chip data segment (ignoring the guard/noise segment).
-  \begin{itemize}
-  \item Noise power estimate: let $\sigma^2$ be estimated from the raw baseband as
-    \[
-      \widehat{\sigma^2} = \frac{\mathrm{median}(|x[n]|^2)}{\ln 2}.
-    \]
-  \item Fine CFO search: for each candidate coarse CFO $\widehat{\Delta f}_{\text{coarse}}$, evaluate
-    \[
-      \widehat{\Delta f} = \arg\max_{\Delta f \in \{\widehat{\Delta f}_{\text{coarse}} + q\cdot 0.25\,\text{Hz}\ :\ q=-8,\dots,8\}} \left|\sum_n y[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2.
-    \]
-  \item Pilot verification: for each pilot symbol $r=0,\dots,N_{\text{pilot}}-1$ at index $\ell_{\text{pilot}}(r)=2+5r$, build the TX-shaped hopped pilot reference $p_r[n]$ for the pilot's $1024$-chip data segment and evaluate a small timing window $\Delta n\in[-32,+32]$ samples around the predicted start $n_{\ell_{\text{pilot}}(r)}$:
-    \[
-      E_r=\max_{\Delta n\in[-32,32]}\left|\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[n_0+n_{\ell_{\text{pilot}}(r)}+\Delta n+n]\cdot p_r^*[n]\cdot e^{-j2\pi\widehat{\Delta f}\,n/F_s}\right|^2.
-    \]
-    The pilot verification energy is $V_{\text{pilot}}=\sum_r E_r$.
-  \item Preamble verification energy: $V_{\text{pre}}$ is the best fine-CFO preamble energy from the previous step.
-  \item Acceptance threshold: define reference energies $E_{\text{pre}}$ (two preamble references) and $E_{\text{sym}}$ (one pilot reference) and compute
-    \[
-      E_{\text{tot}} = E_{\text{pre}} + N_{\text{pilot}}\,E_{\text{sym}},\quad
-      \Gamma = \gamma_{\text{hyb}}\cdot \widehat{\sigma^2}\cdot E_{\text{tot}},\quad
-      \gamma_{\text{hyb}}=10.
-    \]
-    The candidate is accepted if $V_{\text{pre}}+V_{\text{pilot}}>\Gamma$. Among accepted candidates, the receiver selects the one with the largest $V_{\text{pre}}+V_{\text{pilot}}$ (tie-break: smaller $(\mathit{TI},n_{\text{offset,total}})$).
-  \end{itemize}
-
-\item \textbf{Timing Refinement and RAKE Initialization}: Refine the start offset by coherent correlation around the coarse estimate. For better timing discrimination under multipath, the receiver jointly uses \textbf{both} preamble symbols, taking into account the guard length $j_0$ between them.
-
-  Concretely, for each candidate start offset $\hat n$ in the search window (around the coarse estimate), form the two complex correlations
-  \[
-    z_0(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+n]\cdot s_0^*[n],
-  \]
-  \[
-    z_1(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+(\mathit{SF}+j_0)\cdot\mathit{OSF}+n]\cdot s_1^*[n],
-  \]
-  where $s_0,s_1$ are the locally generated TX-shaped preamble references (with the Barker-2 sign pattern and phase-continuous hopping, as in Step~4).
-
-  The timing score is the \textbf{noncoherent} sum of the two per-symbol correlation energies:
-  \[
-    e_0(\hat n)=\left|z_0(\hat n)\right|^2,\quad
-    e_1(\hat n)=\left|z_1(\hat n)\right|^2,\quad
-    \Lambda(\hat n)=e_0(\hat n)+e_1(\hat n).
-  \]
-  Select the refined main-path start:
-  \[
-    \hat n_0=\arg\max_{\hat n}\Lambda(\hat n)\quad(\text{tie-break: smaller }\hat n).
-  \]
-
-  The receiver constructs the returned RAKE finger list $\{\hat{n}_{\text{finger},i}\}$ directly from these hypotheses:
-  \begin{enumerate}
-  \item Sort all hypotheses by descending $\Lambda(\hat n)$ (tie-break: smaller $\hat n$).
-  \item Initialize the finger list with $\hat n_{\text{finger},0}=\hat n_0$.
-  \item Iterate the remaining hypotheses in sorted order and append $\hat n$ to the finger list iff:
-    \begin{itemize}
-    \item $\hat n\ge \hat n_0$ (non-negative delay relative to the main path), and
-    \item $|\hat n-\hat n_{\text{finger},k}|\ge \mathit{OSF}$ for all already-selected fingers $k$ (minimum separation).
-    \end{itemize}
-  \item Stop when either:
-    \begin{itemize}
-    \item the list length reaches $N_{\text{finger,out}}=\mathrm{clamp}(N_{\text{finger,req}},1,16)$, or
-    \item the hypothesis list is exhausted.
-    \end{itemize}
-  \end{enumerate}
-\end{enumerate}
-
-The acquisition output parameters are: $\widehat{\mathit{TI}}_{\text{tx}}$, the main path starting position $\hat{n}_{0}$, the refined CFO estimate $\widehat{\Delta f}$, an \textbf{ordered list} of RAKE finger starting positions $\{\hat{n}_{\text{finger},i}\}_{i=0}^{N_{\text{finger,out}}-1}$ (with $\hat{n}_{\text{finger},0}=\hat n_0$), and the verification statistic $p_{\max}$.
-
-\subsection{Step C: RAKE Reception \& Carrier Synchronization}
-
-Using the acquisition outputs $(\widehat{\mathit{TI}}_{\text{tx}}, \hat{n}_{0}, \widehat{\Delta f}, \{\hat{n}_{\text{finger},i}\})$, perform the following preprocessing on the \textbf{raw} baseband samples:
-
-\begin{enumerate}
-\item \textbf{Post-Acquisition Sample-Offset Refinement}: Refine the sample start position by searching a small integer window $\Delta n\in[-6,6]$ around $\hat{n}_0$ (and apply the same $\Delta n$ to all $\{\hat{n}_{\text{finger},i}\}$). A sample-index error $\Delta n$ introduces the hop-dependent phase error
-  \[
-    \Delta\phi_\ell \approx 2\pi \frac{f_\ell}{F_s}\,\Delta n,
-  \]
-  evaluated per spread symbol $\ell$. The receiver evaluates the refinement candidates in the fixed order:
-  \[
-    \Delta n\in\{0,-1,+1,-2,+2,\dots,-6,+6\}.
-  \]
-  For each candidate $\Delta n$, the receiver applies the same shift to every finger offset $\{\hat n_{\text{finger},i}\}$, then performs CFO derotation, de-hopping, matched filtering, and a full-frame demod/decode.
-  \begin{itemize}
-  \item If any $\Delta n$ yields a CRC-valid decode, the receiver selects the \textbf{first} such $\Delta n$ in the order above and returns that decode result.
-  \item If no $\Delta n$ yields a CRC-valid decode, the receiver selects the $\Delta n$ that maximizes the verification statistic.
-    \[
-      V(\Delta n)=V_{\text{pre}}(\Delta n)+V_{\text{pilot}}(\Delta n),
-    \]
-    where
-    \[
-      V_{\text{pre}}(\Delta n)=\sum_i\left|\left(\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{i,0}[j]\right) - \left(\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{i,1}[j]\right)\right|^2,
-    \]
-    \[
-      V_{\text{pilot}}(\Delta n)=\sum_{\ell\in\mathcal{P}}\left|z_\ell\right|^2,
-    \]
-    $\mathcal{P}$ is the set of pilot symbol indices, and $z_\ell$ is the PLL prompt sum used in Step C.2(a) for preamble/pilots.
-  \end{itemize}
-\item Apply a sample-rate CFO derotation using $\widehat{\Delta f}$:
-  \[
-    x'[n]=x[n]\cdot e^{-j2\pi\widehat{\Delta f}\,n/F_s}.
-  \]
-\item Reconstruct $(C_{\text{seq}},F_{\text{seq}},J_{\text{seq}})$ from $\widehat{\mathit{TI}}_{\text{tx}}$ (via \texttt{GenCode}) and apply a phase-continuous sample-rate \textbf{de-hopping} rotation to $x'[n]$ using $F_{\text{seq}}$ and $J_{\text{seq}}$ (Step~4.B.2). The de-hopping rotation starts at the absolute frame start sample and also rotates the prefix samples that feed the matched filter using the first hop frequency.
-\item Apply the receive RRC matched filter (same taps as the transmitter) using the causal convolution $y[n]=\sum_k h[k]\cdot x'[n-k]$ to obtain the matched-filtered sequence $y[n]$.
-  \begin{itemize}
-  \item The RRC group delay is $D_{\text{rrc}}$ samples (Section~1).
-  \item The cascade (TX+RX) group delay is $D_{\text{cas}}=2D_{\text{rrc}}$ samples. Symbol sampling times are referenced to the frame start plus $D_{\text{cas}}$.
-  \end{itemize}
-\end{enumerate}
-
-All subsequent RAKE/DLL/PLL processing in Step C/D operates on this matched-filtered, de-hopped signal.
-
-\subsubsection*{0. Full-Frame Local Code Generation}
-
-Use the acquired $\widehat{\mathit{TI}}_{\text{tx}}$ to call
+Blind acquisition maps $x[n]$ and $\mathcal{T}$ to an estimate of the frame parameters
 \[
-  (C_{\text{seq}}, F_{\text{seq}}, J_{\text{seq}})=\texttt{GenCode}(K_{\text{sec}}, \widehat{\mathit{TI}}_{\text{tx}}, N_{\text{sym}})
+  \left(\widehat{\mathit{TI}}_{\text{tx}},\ \hat n_{\text{coarse}},\ \widehat{\Delta f},\ \{\hat n_{\text{finger},i}\}_{i=0}^{N_{\text{finger,sel}}-1}\right),
 \]
-to generate the full-frame cryptographic chip masks (for de-masking) as well as the hop/guard schedules (for de-hopping and symbol windowing).
+where $N_{\text{finger,sel}}\le N_{\text{finger,out}}$.
 
-\subsubsection*{1. RAKE Structure}
+\subsubsection{Step B.1: Hypothesis Sets}
 
-The acquisition stage (4.B.2--4.B.3) outputs an ordered list of RAKE finger starting positions $\{\hat{n}_{\text{finger},i}\}_{i=0}^{N_{\text{finger,out}}-1}$ (in samples), with $\hat{n}_{\text{finger},0}=\hat n_0$. The list is ordered by descending preamble correlation energy (tie-break: smaller offset).
-
-Use at most three fingers for tracking and MRC combining:
+Define the intra-epoch sample period
 \[
-  N_{\text{finger}}=\min(3, N_{\text{finger,out}}).
+  N_{\text{IV,samp}}=\mathrm{round}(F_s\cdot \mathit{IV}_{\text{res}}).
 \]
-Define the per-finger integer delay (samples) relative to the main path:
+Define the coarse frame-start hypothesis set (samples)
 \[
-  \Delta d_i = \hat n_{\text{finger},i} - \hat n_{\text{finger},0}.
-\]
-All RAKE/DLL/PLL/MRC processing in Step C uses only the first $N_{\text{finger}}$ offsets and the corresponding $\Delta d_i$.
-
-\subsubsection*{Window Gating (Data vs Guard/Noise)}
-
-For each spread symbol $\ell$, the receiver knows:
-\begin{itemize}
-\item the \textbf{data} segment length is fixed at $1024$ chips,
-\item the following \textbf{guard/noise} segment length is $j_\ell$ chips (from $J_{\text{seq}}$).
-\end{itemize}
-The RAKE receiver integrates only over the $1024$-chip data window. During the $j_\ell$ guard/noise interval, the receiver does not update its correlators.
-
-\subsubsection*{2. Dual-Loop Tracking (Carrier + Code Timing)}
-
-Tracking runs at the spread-symbol rate $\ell=0,\dots,N_{\text{sym}}-1$ and updates only on the $1024$-chip data window of each symbol.
-
-All divisions that use an $\epsilon$ term use $\epsilon=10^{-18}$. Phase wrapping uses
-\[
-  \mathrm{wrap}_{(-\pi,\pi]}(x) = (x+\pi)\bmod (2\pi) - \pi.
+  \mathcal{N}_{\text{coarse}}=\{0, N_{\text{off,stride}}, 2N_{\text{off,stride}}, \dots\}\cap [0, N_{\text{IV,samp}}).
 \]
 
-\paragraph{2.a Carrier Tracking (PLL/Costas with Frequency Bank)}
+\subsubsection{Step B.2: Coarse Preamble Metric and Coarse CFO Estimate}
 
-The carrier tracker maintains two real-valued states:
-\begin{itemize}
-\item $\theta_\ell$ (rad): residual carrier phase at the start of the symbol's data window.
-\item $\omega_\ell$ (rad): residual carrier phase advance across the symbol's data window of duration $T_{\text{data}}=\mathit{SF}/R_c$.
-\end{itemize}
-
-Carrier compensation across chips uses the per-chip phasor
+For a hypothesis pair $(\mathit{TI},n_0)\in\mathcal{T}\times\mathcal{N}_{\text{coarse}}$, define the locally generated schedules
 \[
-  r_{\ell}[j]=\exp\left(-j\left(\theta_\ell + \frac{\omega_\ell}{\mathit{SF}}j\right)\right),\quad j=0,\dots,\mathit{SF}-1.
+  (C_{\text{seq}}, F_{\text{seq}}, J_{\text{seq}})=\texttt{GenCode}(K_{\text{sec}}, \mathit{TI}, N_{\text{sym}}),
+\]
+and the symbol start offsets (relative to the frame start, in samples)
+\[
+  n_\ell = \left(\sum_{k=0}^{\ell-1} (\mathit{SF}+j_k)\right)\cdot \mathit{OSF},\quad \ell=0,\dots,N_{\text{sym}}-1.
 \]
 
-Per symbol, a frequency hypothesis bank searches small offsets around $\omega_\ell$:
-\begin{itemize}
-\item Bank offsets: $\Delta f_h \in \{-4.0,-3.75,\dots,+4.0\}\,\text{Hz}$ with step $0.25\,\text{Hz}$.
-\item Map to phase offsets: $\Delta\omega_h = 2\pi\,\Delta f_h\,T_{\text{data}}$.
-\item Hypothesis: $\omega_{\ell,h}=\mathrm{clamp}(\omega_\ell+\Delta\omega_h,\ [-\omega_{\max},+\omega_{\max}])$, with $\omega_{\max}=2\pi\cdot 200\,\text{Hz}\cdot T_{\text{data}}$.
-\end{itemize}
+Let $s_0[n]$ and $s_1[n]$ be the locally generated TX-shaped, hopped preamble reference waveforms for preamble symbols $\ell=0,1$ (Barker-2 sign pattern $+W_0,-W_0$), each restricted to its $1024$-chip data segment. Let $\Delta n_1=(\mathit{SF}+j_0)\cdot \mathit{OSF}$ be the sample separation between the two preamble symbol starts. Phase continuity across the preamble boundary is defined by including the accumulated hop phase at the start of $s_1[n]$.
 
-For each hypothesis $h$, rotate the combined (MRC) chip vector $\mathbf{u}_\ell[j]$ by $r_{\ell,h}[j]$ and compute:
-\begin{itemize}
-\item \textbf{Preamble/Pilot ($W_0$ known)}:
-  \[
-    z_{\ell,h}=\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_\ell[j]\cdot r_{\ell,h}[j],\quad
-    h_{\text{best}}=\arg\max_h |z_{\ell,h}|^2.
-  \]
-\item \textbf{Data}:
-  \[
-    R_{\ell,h}[m]=\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_\ell[j]\cdot r_{\ell,h}[j]\cdot W_m[j].
-  \]
-  Use a 1024-point FHT to compute all $m\in[0,1023]$ and retain $m\in[0,255]$. Select
-  \[
-    (h_{\text{best}},\hat m_\ell)=\arg\max_{h,m\in[0,255]} |R_{\ell,h}[m]|^2.
-  \]
-\end{itemize}
-
-Define confidence measures:
-\begin{itemize}
-\item For data-symbol code confidence, let $P_1$ and $P_2$ be the largest and second-largest values of $|R_{\ell,h_{\text{best}}}[m]|^2$ over $m\in[0,255]$, then
-  \[
-    \mathrm{conf}_{\text{code}}=\frac{P_1-P_2}{|P_1|+\epsilon}.
-  \]
-\item For frequency-bank confidence, let $Q_1$ and $Q_2$ be the largest and second-largest values of the selected hypothesis score (pilot: $|z_{\ell,h}|^2$; data: peak $|R_{\ell,h}[\cdot]|^2$), then
-  \[
-    \mathrm{conf}_{\text{freq}}=\frac{Q_1-Q_2}{|Q_1|+\epsilon}.
-  \]
-\end{itemize}
-
-Carrier state update uses a predict-then-correct structure:
-\begin{enumerate}
-\item \textbf{Predict}: the symbol spans the data window plus the guard/noise window. Let $j_\ell$ be the guard length in chips. The phase advance from the end of the data window to the start of the next data window is modeled by scaling with
-  \[
-    s_\ell = 1 + \frac{j_\ell}{\mathit{SF}}.
-  \]
-  With the selected $\omega_{\ell,h_{\text{best}}}$, predict:
-  \[
-    \theta_{\ell}\leftarrow \mathrm{wrap}_{(-\pi,\pi]}(\theta_{\ell} + \omega_{\ell,h_{\text{best}}}\, s_\ell).
-  \]
-\item \textbf{Correct}:
-  \begin{itemize}
-  \item For preamble/pilot, compute $z_\ell=z_{\ell,h_{\text{best}}}$.
-  \item For data, compute $z_\ell=R_{\ell,h_{\text{best}}}[\hat m_\ell]$ and rotate it so the decided peak is real-positive: if $\Re\{z_\ell\}<0$ then $z_\ell\leftarrow -z_\ell$.
-  \item Phase error:
-    \[
-      e_\ell=\operatorname{atan2}(\Im\{z_\ell\},\Re\{z_\ell\}+\epsilon).
-    \]
-  \item Apply a PI correction with gains $(K_p,K_i)$ and a mode-dependent scale:
-    \[
-      \omega_{\ell+1}=\mathrm{clamp}\left(\omega_\ell + (K_i\cdot s_{\text{dd}})\,e_\ell,\ [-\omega_{\max},+\omega_{\max}]\right),
-    \]
-    \[
-      \theta_{\ell}\leftarrow \mathrm{wrap}_{(-\pi,\pi]}\left(\theta_{\ell} + (K_p\cdot s_{\text{dd}})\,e_\ell\right),
-    \]
-    where $s_{\text{dd}}=1.0$ for preamble/pilots and $s_{\text{dd}}=0.5$ for decision-directed data updates.
-  \end{itemize}
-\end{enumerate}
-
-Pilot cycle-slip guard:
-\begin{itemize}
-\item Let $M_{\text{pre}}$ be a fixed preamble magnitude reference computed at initialization.
-\item If a pilot symbol yields $\Re\{z_\ell\}<0$ and $|z_\ell|>0.25\,M_{\text{pre}}$, then apply:
-  \[
-    \theta_\ell\leftarrow \mathrm{wrap}_{(-\pi,\pi]}(\theta_\ell+\pi),\quad A_i\leftarrow -A_i\ \ \forall i,
-  \]
-  and recompute the MRC weights $w_i$.
-\end{itemize}
-
-Frequency snap (anti-slip):
-\begin{itemize}
-\item If $\mathrm{conf}_{\text{freq}}\ge 0.15$ and the selected nonzero bank offset $\Delta f_{h_{\text{best}}}$ stays within $\pm 0.125\,\text{Hz}$ of a constant value for 3 consecutive symbols, then:
-  \begin{itemize}
-  \item if $|\Delta f_{h_{\text{best}}}|\ge 0.75\,\text{Hz}$, update $\omega_\ell \leftarrow \mathrm{clamp}(\omega_\ell + 2\pi\,\Delta f_{h_{\text{best}}}\,T_{\text{data}},\ [-\omega_{\max},+\omega_{\max}])$;
-  \item otherwise, do not change $\omega_\ell$;
-  \item reset the snap state.
-  \end{itemize}
-\end{itemize}
-
-Loop gain design:
-\begin{itemize}
-\item Let $T_{\text{upd}}$ be the nominal per-symbol update period (data+guard). Define
-  \[
-    T_{\text{upd}}=\frac{\mathit{SF}+j_{\text{avg}}}{R_c},\quad j_{\text{avg}} = 40 + \frac{50}{2}.
-  \]
-\item Gains are designed in discrete time via pole mapping. Given loop bandwidth $B_L$ (Hz) and damping $\zeta$, let $\omega_n=2\pi B_L$ and
-  \[
-    r=\exp(-\zeta\omega_n T_{\text{upd}}),\quad \phi=\omega_n\sqrt{1-\zeta^2}\,T_{\text{upd}}.
-  \]
-\item The PI gains are
-  \[
-    K_p = 1-r^2,\quad K_i = 1+r^2-2r\cos\phi.
-  \]
-\item Fixed values:
-  \begin{itemize}
-  \item PLL: $B_L=1.0\,\text{Hz}$, $\zeta=0.707$.
-  \end{itemize}
-\end{itemize}
-
-\paragraph{2.b Code Timing Tracking (Early/Late DLL)}
-
-The DLL tracks the chip sampling step in samples-per-symbol, $\mathit{step}_\ell$.
-\begin{itemize}
-\item Nominal: $\mathit{step}_{\text{nom}}=\mathit{SF}\cdot\mathit{OSF}$.
-\item Clamp: $\mathit{step}_{\min}=\mathit{step}_{\text{nom}}(1-2000\cdot 10^{-6})$, $\mathit{step}_{\max}=\mathit{step}_{\text{nom}}(1+2000\cdot 10^{-6})$.
-\item Early/late spacing: $0.5$ chips.
-\end{itemize}
-
-Let $\Delta_{\text{EL}} = 0.5\cdot \mathit{step}_\ell/\mathit{SF}$ (samples) and sample Early/Prompt/Late with linear interpolation. After demasking, hop-delay compensation, carrier compensation (using the selected hypothesis $h_{\text{best}}$), and MRC combining, form the Early/Late prompt correlator outputs:
-\begin{itemize}
-\item If the symbol uses $W_0$ (preamble/pilot): $z_E=\sum_j \mathbf{u}_E[j]$, $z_L=\sum_j \mathbf{u}_L[j]$.
-\item If the symbol uses Walsh index $\hat m_\ell$ (data): $z_E=\sum_j \mathbf{u}_E[j]W_{\hat m_\ell}[j]$, $z_L=\sum_j \mathbf{u}_L[j]W_{\hat m_\ell}[j]$.
-\end{itemize}
-
-Define magnitudes $A_E=|z_E|$, $A_L=|z_L|$ and the normalized early/late discriminator:
+Define the preamble observation window $x_{n_0}[n]=x[n_0+n]$ and the sparse matched window
 \[
-  d_\ell=\frac{A_E-A_L}{A_E+A_L+\epsilon}.
-\]
-Map to a sample-domain timing error:
-\[
-  e_{\text{DLL},\ell} = d_\ell\cdot\frac{\Delta_{\text{EL}}}{2}.
+  y_{\mathit{TI},n_0}[n]=
+  \begin{cases}
+  x_{n_0}[n]\cdot s_0^*[n] & n\in[0, \mathit{SF}\cdot\mathit{OSF}) \\
+  0 & n\in[\mathit{SF}\cdot\mathit{OSF}, (\mathit{SF}+j_0)\cdot\mathit{OSF}) \\
+  x_{n_0}[n]\cdot s_1^*[n-\Delta n_1] & n\in[\Delta n_1, \Delta n_1+\mathit{SF}\cdot\mathit{OSF})
+  \end{cases}.
 \]
 
-The DLL applies a PI update:
+Let $\widetilde y_{\mathit{TI},n_0}[n]$ be the length-$N_{\text{FFT}}$ zero-padded sequence defined by $\widetilde y_{\mathit{TI},n_0}[n]=y_{\mathit{TI},n_0}[n]$ for valid $n$ in the window above and $\widetilde y_{\mathit{TI},n_0}[n]=0$ otherwise. Define
 \[
-  \mathit{step}_{\ell+1}=\mathrm{clamp}\left(\mathit{step}_\ell - (K_i^{\text{DLL}}\cdot s_{\text{dd}}^{\text{DLL}})\,e_{\text{DLL},\ell},\ [\mathit{step}_{\min},\mathit{step}_{\max}]\right),
+  Y_{\mathit{TI},n_0}[k]=\mathrm{FFT}_{N_{\text{FFT}}}\{\widetilde y_{\mathit{TI},n_0}[n]\}[k].
+\]
+
+Define the bin limit
+\[
+  k_{\max}=\left\lfloor \frac{\min(f_{\text{search}},F_s/2)\,N_{\text{FFT}}}{F_s}\right\rfloor,\quad k_{\max}\in[1,N_{\text{FFT}}/2-1],
+\]
+and the selected coarse bin
+\[
+  k_0=\arg\max_{k\in\{0,1,\dots,k_{\max}\}\cup\{N_{\text{FFT}}-k_{\max},\dots,N_{\text{FFT}}-1\}} |Y_{\mathit{TI},n_0}[k]|^2.
+\]
+Let $b_0\in[-k_{\max},k_{\max}]$ be the signed bin index corresponding to $k_0$. For $|b_0|<k_{\max}$, define the quadratic interpolation
+\[
+  \delta = \frac{1}{2}\frac{P_{-1}-P_{+1}}{P_{-1}-2P_0+P_{+1}},\quad b=b_0+\delta,
+\]
+with $P_{-1}=|Y_{\mathit{TI},n_0}[b_0-1]|^2$, $P_0=|Y_{\mathit{TI},n_0}[b_0]|^2$, $P_{+1}=|Y_{\mathit{TI},n_0}[b_0+1]|^2$ (circular indexing). The coarse CFO estimate is
+\[
+  \widehat{\Delta f}_{\text{coarse}}(\mathit{TI},n_0)=b\cdot \frac{F_s}{N_{\text{FFT}}}.
+\]
+
+Define the fine CFO grid
+\[
+  \mathcal{F}_{\text{fine}}(\mathit{TI},n_0)=\left\{\widehat{\Delta f}_{\text{coarse}}(\mathit{TI},n_0)+q\Delta f_{\text{fine}}:\ q\in\{-8,\dots,8\}\right\}.
+\]
+The refined CFO estimate $\widehat{\Delta f}(\mathit{TI},n_0)$ and the refined preamble energy $V_{\text{pre}}(\mathit{TI},n_0)$ are defined by
+\[
+  \widehat{\Delta f}(\mathit{TI},n_0)=\arg\max_{\Delta f\in\mathcal{F}_{\text{fine}}(\mathit{TI},n_0)}\left|\sum_n y_{\mathit{TI},n_0}[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2,
 \]
 \[
-  \Delta t_\ell = -(K_p^{\text{DLL}}\cdot s_{\text{dd}}^{\text{DLL}})\,e_{\text{DLL},\ell}.
+  V_{\text{pre}}(\mathit{TI},n_0)=\max_{\Delta f\in\mathcal{F}_{\text{fine}}(\mathit{TI},n_0)}\left|\sum_n y_{\mathit{TI},n_0}[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2.
 \]
-The fractional timing adjustment $\Delta t_\ell$ is applied to the symbol timeline. The decision-directed DLL scale is $s_{\text{dd}}^{\text{DLL}}=0.25$ for data symbols and $s_{\text{dd}}^{\text{DLL}}=1.0$ for preamble/pilots.
 
-DLL gains use the same discrete-time pole-mapping design with fixed values:
-\begin{itemize}
-\item DLL: $B_L=0.6\,\text{Hz}$, $\zeta=0.707$.
-\end{itemize}
+\subsubsection{Step B.3: Pilot Verification and Candidate Selection}
 
-\subsubsection*{3. Despreading and Combining}
-
-For each spread symbol $\ell$ and each finger $i$, the receiver samples the $1024$-chip data window, de-masks it, applies hop-delay phase compensation, and then combines fingers with MRC.
-
-\begin{enumerate}
-\item \textbf{Chip Sampling with Linear Interpolation}: Let $t_{i,\ell}$ be the tracked symbol start time (samples) for finger $i$ and symbol $\ell$, and let the tracked samples-per-chip be $\Delta_{\text{chip}}=\mathit{step}_\ell/\mathit{SF}$. For each chip index $j=0,\dots,\mathit{SF}-1$, sample from the matched-filtered signal $y[n]$ at
-  \[
-    p=t_{i,\ell}+j\Delta_{\text{chip}}.
-  \]
-  With $n_0=\lfloor p\rfloor$ and $a=p-n_0\in[0,1)$, the interpolated sample is
-  \[
-    \mathbf{y}_{i,\ell}[j]=(1-a)\,y[n_0] + a\,y[n_0+1].
-  \]
-\item \textbf{De-masking}: multiply by the locally generated chip mask:
-  \[
-    \mathbf{u}_{i,\ell}[j] = \mathbf{y}_{i,\ell}[j]\cdot C_{\text{seq}}[\ell\cdot \mathit{SF}+j].
-  \]
-  For the second preamble symbol ($\ell=1$), apply the Barker-2 sign:
-  \[
-    \mathbf{u}_{i,1}[j]\leftarrow -\mathbf{u}_{i,1}[j].
-  \]
-\item \textbf{Hop-delay phase compensation}: for the $i$-th finger, let $\Delta d_i$ be the integer delay (samples) relative to the main finger (Step C.1). For symbol $\ell$, compute
-  \[
-    c_{i,\ell}=\exp\!\left(+j2\pi f_\ell \frac{\Delta d_i}{F_s}\right),
-  \]
-  and apply
-  \[
-    \mathbf{u}_{i,\ell}[j]\leftarrow \mathbf{u}_{i,\ell}[j]\cdot c_{i,\ell}.
-  \]
-  The receiver applies this compensation to all branches that enter MRC, including prompt and the DLL Early/Late branches.
-\end{enumerate}
-
-All fingers are combined using Maximal-Ratio Combining (MRC) by a weighted sum in the chip domain to obtain the de-masked chip vector for that symbol:
+Define a noise power estimate from the raw baseband samples
 \[
-  \mathbf{u}_{\ell}[j]=\sum_i w_i\cdot \mathbf{u}_{i,\ell}[j],\quad w_i=\frac{A_i^*}{\sum_k |A_k|^2}.
+  \widehat{\sigma^2} = \frac{\mathrm{median}(|x[n]|^2)}{\ln 2}.
 \]
-where $A_i$ is the estimated complex channel gain for the $i$-th finger. $A_i$ is initialized from the two preamble symbols and is updated on every pilot symbol with an exponential smoother with $\alpha=\frac{1}{16}$:
+
+Pilot symbol indices are defined by $\ell_{\text{pilot}}(r)=2+5r$, $r=0,\dots,N_{\text{pilot}}-1$. For each pilot $r$, let $p_r[n]$ be the locally generated TX-shaped, hopped pilot reference waveform for the pilot's $1024$-chip data segment. Define the pilot verification energy
+\[
+  E_r(\mathit{TI},n_0)=\max_{\Delta n\in[-N_{\text{pilot,win}},N_{\text{pilot,win}}]}\left|\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x\!\left[n_0+n_{\ell_{\text{pilot}}(r)}+\Delta n+n\right]\cdot p_r^*[n]\cdot e^{-j2\pi\widehat{\Delta f}(\mathit{TI},n_0)\,n/F_s}\right|^2,
+\]
+and
+\[
+  V_{\text{pilot}}(\mathit{TI},n_0)=\sum_{r=0}^{N_{\text{pilot}}-1}E_r(\mathit{TI},n_0).
+\]
+
+Define the hybrid acceptance threshold
+\[
+  E_{\text{tot}} = E_{\text{pre}} + N_{\text{pilot}}\,E_{\text{sym}},\quad
+  \Gamma = \gamma_{\text{hyb}}\cdot \widehat{\sigma^2}\cdot E_{\text{tot}}.
+\]
+The reference energies are defined by
+\[
+  E_{\text{pre}}=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1}|s_0[n]|^2+\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1}|s_1[n]|^2,\quad
+  E_{\text{sym}}=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1}|p_0[n]|^2.
+\]
+Define the accepted set
+\[
+  \mathcal{H}_{\text{acc}}=\left\{(\mathit{TI},n_0)\in\mathcal{T}\times\mathcal{N}_{\text{coarse}}:\ V_{\text{pre}}(\mathit{TI},n_0)+V_{\text{pilot}}(\mathit{TI},n_0)>\Gamma\right\}.
+\]
+If $\mathcal{H}_{\text{acc}}=\emptyset$, acquisition fails. Otherwise,
+\[
+  (\widehat{\mathit{TI}}_{\text{tx}},\hat n_{\text{coarse}})=\arg\max_{(\mathit{TI},n_0)\in\mathcal{H}_{\text{acc}}}\left(V_{\text{pre}}(\mathit{TI},n_0)+V_{\text{pilot}}(\mathit{TI},n_0)\right),
+\]
+with tie-break by smaller $(\mathit{TI},n_0)$.
+
+\subsubsection{Step B.4: Timing Refinement and RAKE Finger Set}
+
+Define the timing-refinement window (samples)
+\[
+  \mathcal{W}=\left\{\hat n_{\text{coarse}}-N_{\text{rake}},\dots,\hat n_{\text{coarse}}+N_{\text{rake}}\right\}.
+\]
+For each $\hat n\in\mathcal{W}$, define the two coherent preamble correlations
+\[
+  z_0(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+n]\cdot s_0^*[n],
+\]
+\[
+  z_1(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+\Delta n_1+n]\cdot s_1^*[n],
+\]
+and the noncoherent timing score
+\[
+  \Lambda(\hat n)=|z_0(\hat n)|^2+|z_1(\hat n)|^2.
+\]
+The refined main-path start is
+\[
+  \hat n_0=\arg\max_{\hat n\in\mathcal{W}}\Lambda(\hat n),
+\]
+with tie-break by smaller $\hat n$.
+
+Define the local-maximum set
+\[
+  \mathcal{M}=\left\{\hat n\in\mathcal{W}:\ \Lambda(\hat n)\ge \Lambda(\hat n-1)\ \wedge\ \Lambda(\hat n)>\Lambda(\hat n+1)\right\},
+\]
+with boundary cases interpreted by restricting to valid indices in $\mathcal{W}$. Define $\mathcal{M}_+=\{\hat n\in\mathcal{M}:\hat n\ge \hat n_0\}$.
+
+Define the (unordered) RAKE finger set as any maximizer of
+\[
+  \mathcal{F}^\star\in\arg\max_{\substack{\mathcal{F}\subseteq\mathcal{M}_+\\ |\mathcal{F}|\le N_{\text{finger,out}}\\ \hat n_0\in\mathcal{F}\\ \forall \hat n_i\neq \hat n_j\in\mathcal{F}:\ |\hat n_i-\hat n_j|\ge \mathit{OSF}}}\ \sum_{\hat n\in\mathcal{F}}\Lambda(\hat n),
+\]
+with tie-break by choosing the lexicographically smallest sequence obtained by ordering $\mathcal{F}$ by descending $\Lambda(\hat n)$ and then ascending $\hat n$.
+
+Let $N_{\text{finger,sel}}=|\mathcal{F}^\star|$. The ordered RAKE finger list $\{\hat n_{\text{finger},i}\}_{i=0}^{N_{\text{finger,sel}}-1}$ is defined as the elements of $\mathcal{F}^\star$ ordered by descending $\Lambda(\hat n)$ (tie-break: smaller $\hat n$).
+
+The acquisition verification statistic is
+\[
+  V_{\text{acq}}=V_{\text{pre}}(\widehat{\mathit{TI}}_{\text{tx}},\hat n_{\text{coarse}})+V_{\text{pilot}}(\widehat{\mathit{TI}}_{\text{tx}},\hat n_{\text{coarse}}).
+\]
+
+\subsection{Step C: Matched Filtering, RAKE, and Tracking}
+
+This step defines the matched-filtered, de-hopped sequence and the carrier/code tracking state variables that parameterize demodulation.
+
+\subsubsection{Step C.1: Frame-Start Refinement}
+
+Define the candidate shift set $\Delta\mathcal{N}=\{-N_{\Delta n},\dots,+N_{\Delta n}\}$ and the preference rank function
+\[
+  \rho(0)=0,\quad \rho(-d)=2d-1,\quad \rho(+d)=2d,\quad d=1,\dots,N_{\Delta n}.
+\]
+For each $\Delta n\in\Delta\mathcal{N}$, define the candidate frame start $\hat n_{\text{frm}}(\Delta n)=\hat n_0+\Delta n$ and shifted finger starts $\hat n_{\text{finger},i}(\Delta n)=\hat n_{\text{finger},i}+\Delta n$.
+
+Let $\hat U(\Delta n)$ be the decoded information bits produced by applying Steps~C--D with frame start $\hat n_{\text{frm}}(\Delta n)$ and finger starts $\{\hat n_{\text{finger},i}(\Delta n)\}$. Let $\mathrm{CRC}(\hat U(\Delta n))\in\{0,1\}$ be the CRC-32C verification result.
+
+Define the CRC-valid set $\Delta\mathcal{N}_{\text{crc}}=\{\Delta n\in\Delta\mathcal{N}:\mathrm{CRC}(\hat U(\Delta n))=1\}$. If $\Delta\mathcal{N}_{\text{crc}}\neq\emptyset$, then
+\[
+  \Delta n^\star=\arg\min_{\Delta n\in\Delta\mathcal{N}_{\text{crc}}}\rho(\Delta n).
+\]
+Otherwise define the verification statistic
+\[
+  V(\Delta n)=V_{\text{pre}}(\Delta n)+V_{\text{pilot}}(\Delta n),
+\]
+with
+\[
+  V_{\text{pre}}(\Delta n)=\sum_i\left|\left(\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{i,0}[j]\right)+\left(\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{i,1}[j]\right)\right|^2,
+\]
+\[
+  V_{\text{pilot}}(\Delta n)=\sum_{\ell\in\mathcal{P}}|z_\ell|^2,
+\]
+where $\mathbf{u}_{i,\ell}[j]$ is defined in Step~C.4 and $z_\ell$ is defined in Step~C.5. The selected shift is
+\[
+  \Delta n^\star=\arg\max_{\Delta n\in\Delta\mathcal{N}} V(\Delta n),
+\]
+with tie-break by smaller $\rho(\Delta n)$.
+
+The refined frame start and finger starts are
+\[
+  \hat n_{\text{frm}}=\hat n_{\text{frm}}(\Delta n^\star),\quad \hat n_{\text{finger},i}^{\star}=\hat n_{\text{finger},i}(\Delta n^\star).
+\]
+
+\subsubsection{Step C.2: CFO Derotation, De-hopping, and Matched Filtering}
+
+Define the CFO-derotated sequence
+\[
+  x_{\text{cfo}}[n]=x[n]\cdot e^{-j2\pi\widehat{\Delta f}\,n/F_s}.
+\]
+
+Define the full-frame schedules from $\widehat{\mathit{TI}}_{\text{tx}}$:
+\[
+  (C_{\text{seq}}, F_{\text{seq}}, J_{\text{seq}})=\texttt{GenCode}(K_{\text{sec}}, \widehat{\mathit{TI}}_{\text{tx}}, N_{\text{sym}}).
+\]
+Define the symbol start offsets (samples)
+\[
+  n_\ell = \left(\sum_{k=0}^{\ell-1} (\mathit{SF}+j_k)\right)\cdot \mathit{OSF},\quad \ell=0,\dots,N_{\text{sym}}-1.
+\]
+
+Define the phase-continuous de-hopping phasor on the frame-relative sample index $m=n-\hat n_{\text{frm}}$. Let $\ell(m)$ be the unique symbol index whose time span (data+guard) contains $m$; for $m<0$, define $\ell(m)=0$. Define
+\[
+  \Phi[-1]=0.
+\]
+\[
+  \Phi[m]=\Phi[m-1]+2\pi\frac{f_{\ell(m)}}{F_s},\quad D[m]=e^{-j\Phi[m]}.
+\]
+The de-hopped sequence is
+\[
+  x_{\text{dh}}[n]=x_{\text{cfo}}[n]\cdot D[n-\hat n_{\text{frm}}].
+\]
+
+Define the matched-filter output (receive RRC, same taps as the transmitter)
+\[
+  y[n]=\sum_k h[k]\cdot x_{\text{dh}}[n-k].
+\]
+The RRC group delay is $D_{\text{rrc}}$ samples and the cascade group delay is $D_{\text{cas}}=2D_{\text{rrc}}$ samples.
+
+\subsubsection{Step C.3: RAKE Geometry and Windowing}
+
+Let $N_{\text{finger,sel}}$ be the number of acquired finger positions and define
+\[
+  N_{\text{finger}}=\min(N_{\text{finger,max}}, N_{\text{finger,sel}}).
+\]
+Define the per-finger integer delay (samples) relative to the main finger:
+\[
+  \Delta d_i = \hat n_{\text{finger},i}^{\star} - \hat n_{\text{finger},0}^{\star},\quad i=0,\dots,N_{\text{finger}}-1.
+\]
+
+Define the pilot symbol index set
+\[
+  \mathcal{P}=\{\ell_{\text{pilot}}(r): r=0,\dots,N_{\text{pilot}}-1\},\quad \ell_{\text{pilot}}(r)=2+5r.
+\]
+
+For each spread symbol $\ell$, the data segment length is $\mathit{SF}$ chips and the guard/noise segment length is $j_\ell$ chips. All correlation and tracking quantities are defined on the $1024$-chip data window only.
+
+\subsubsection{Step C.4: Despreading and MRC Combining}
+
+Define the common timing correction state $\tau_\ell$ (samples) with initialization $\tau_0=0$ and update $\tau_{\ell+1}=\tau_\ell+\Delta t_\ell$, where $\Delta t_\ell$ is defined by the DLL in Step~C.6.
+
+Define the tracked symbol start time for finger $i$ and symbol $\ell$ (samples)
+\[
+  t_{i,\ell}=\hat n_{\text{finger},i}^{\star}+D_{\text{cas}}+n_\ell+\tau_\ell.
+\]
+Define the tracked samples-per-chip $\Delta_{\text{chip}}=\mathit{step}_\ell/\mathit{SF}$. For each chip index $j=0,\dots,\mathit{SF}-1$, define the fractional sample index
+\[
+  p=t_{i,\ell}+j\Delta_{\text{chip}},\quad n_0=\lfloor p\rfloor,\quad a=p-n_0\in[0,1),
+\]
+and the linearly interpolated matched-filter sample
+\[
+  \mathbf{y}_{i,\ell}[j]=(1-a)\,y[n_0]+a\,y[n_0+1].
+\]
+
+Define the Barker-2 sign factor
+\[
+  b_\ell=
+  \begin{cases}
+  -1 & \ell=1\\
+  +1 & \text{otherwise}
+  \end{cases}.
+\]
+Define the hop-delay phase compensation factor
+\[
+  c_{i,\ell}=\exp\!\left(+j2\pi f_\ell \frac{\Delta d_i}{F_s}\right).
+\]
+The despread, hop-compensated chip vector is defined by
+\[
+  \mathbf{u}_{i,\ell}[j]=b_\ell\cdot \mathbf{y}_{i,\ell}[j]\cdot C_{\text{seq}}[\ell\cdot \mathit{SF}+j]\cdot c_{i,\ell}.
+\]
+
+Define the polarity state $p_\ell\in\{+1,-1\}$ with initialization $p_0=+1$ (updated by the cycle-slip rule in Step~C.5). The MRC weights and the combined chip vector are defined by
+\[
+  w_{i,\ell}=\frac{(p_\ell A_i)^*}{\sum_k |A_k|^2},\quad \mathbf{u}_{\ell}[j]=\sum_i w_{i,\ell}\cdot \mathbf{u}_{i,\ell}[j].
+\]
+The per-finger channel gains $A_i$ are initialized from the two preamble symbols and updated on pilot symbols with an exponential smoother ($\alpha_A=\frac{1}{16}$). For pilot index $r$ with symbol $\ell_{\text{pilot}}(r)$,
 \[
   \tilde A_i^{(r)}=\frac{1}{\mathit{SF}}\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{i,\ell_{\text{pilot}}(r)}[j]\cdot r_{\ell_{\text{pilot}}(r),h_{\text{best}}}[j],\quad
-  A_i^{(r)}=(1-\alpha)A_i^{(r-1)}+\alpha\tilde A_i^{(r)},\quad
-  \alpha=\frac{1}{16}.
+  A_i^{(r)}=(1-\alpha_A)A_i^{(r-1)}+\alpha_A\tilde A_i^{(r)}.
 \]
+
+\subsubsection{Step C.5: Carrier Tracking (PLL/Costas with Frequency Bank)}
+
+Define the phase wrapping function
+\[
+  \mathrm{wrap}_{(-\pi,\pi]}(x)=(x+\pi)\bmod (2\pi)-\pi.
+\]
+
+The carrier-tracking state is $(\theta_\ell,\omega_\ell)$, where $\theta_\ell$ is the residual carrier phase at the start of the data window and $\omega_\ell$ is the residual phase advance across the data window of duration $T_{\text{data}}=\mathit{SF}/R_c$.
+
+Define the per-chip compensation phasor
+\[
+  r_{\ell,h}[j]=\exp\left(-j\left(\theta_\ell + \frac{\omega_{\ell,h}}{\mathit{SF}}j\right)\right),\quad j=0,\dots,\mathit{SF}-1,
+\]
+with frequency-bank hypotheses
+\[
+  \Delta\omega_h = 2\pi\,\Delta f_h\,T_{\text{data}},\quad
+  \omega_{\ell,h}=\min\!\left(\max\!\left(\omega_\ell+\Delta\omega_h,-\omega_{\max}\right),\omega_{\max}\right),
+\]
+and $\omega_{\max}=2\pi f_{\text{PLL,max}}T_{\text{data}}$.
+
+For preamble/pilot symbols ($W_0$), define the hypothesis score
+\[
+  z_{\ell,h}=\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_\ell[j]\cdot r_{\ell,h}[j],\quad
+  h_{\text{best}}=\arg\max_h |z_{\ell,h}|^2.
+\]
+For data symbols, define
+\[
+  R_{\ell,h}[m]=\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_\ell[j]\cdot r_{\ell,h}[j]\cdot W_m[j],\quad m\in[0,255],
+\]
+and
+\[
+  (h_{\text{best}},\hat m_\ell)=\arg\max_{h,m\in[0,255]} |R_{\ell,h}[m]|^2.
+\]
+
+Let $P_{(1)}\ge P_{(2)}$ be the largest and second-largest values of $|R_{\ell,h_{\text{best}}}[m]|^2$ over $m\in[0,255]$, and let $Q_{(1)}\ge Q_{(2)}$ be the largest and second-largest values of the selected hypothesis score (pilot: $|z_{\ell,h}|^2$; data: $\max_m |R_{\ell,h}[m]|^2$). Define
+\[
+  \mathrm{conf}_{\text{code}}=\frac{P_{(1)}-P_{(2)}}{P_{(1)}+\epsilon},\quad
+  \mathrm{conf}_{\text{freq}}=\frac{Q_{(1)}-Q_{(2)}}{Q_{(1)}+\epsilon}.
+\]
+
+Define the symbol span factor
+\[
+  s_\ell = 1 + \frac{j_\ell}{\mathit{SF}}.
+\]
+Define the decision statistic
+\[
+  z_\ell=
+  \begin{cases}
+  z_{\ell,h_{\text{best}}} & \ell\in\{0,1\}\cup\mathcal{P}\\
+  R_{\ell,h_{\text{best}}}[\hat m_\ell] & \text{otherwise}
+  \end{cases},
+\quad
+  \tilde z_\ell=
+  \begin{cases}
+  z_\ell & \Re\{z_\ell\}\ge 0\\
+  -z_\ell & \Re\{z_\ell\}<0
+  \end{cases}.
+\]
+Define the phase error
+\[
+  e_\ell=\operatorname{atan2}(\Im\{\tilde z_\ell\},\Re\{\tilde z_\ell\}+\epsilon).
+\]
+Define the decision-directed scale
+\[
+  s_{\text{dd}}=
+  \begin{cases}
+  1.0 & \ell\in\{0,1\}\cup\mathcal{P}\\
+  0.5 & \text{otherwise}
+  \end{cases}.
+\]
+
+Given PLL gains $(K_p,K_i)$, define the carrier state update
+\[
+  \omega_{\ell+1}^{(0)}=\min\!\left(\max\!\left(\omega_\ell + (K_i s_{\text{dd}})\,e_\ell,-\omega_{\max}\right),\omega_{\max}\right),
+\]
+\[
+  \theta_{\ell+1}=\mathrm{wrap}_{(-\pi,\pi]}\!\left(\theta_\ell + \omega_{\ell,h_{\text{best}}} s_\ell + (K_p s_{\text{dd}})\,e_\ell\right).
+\]
+
+Define the pilot cycle-slip indicator using a preamble magnitude reference $M_{\text{pre}}$:
+\[
+  \chi_\ell=
+  \begin{cases}
+  1 & \ell\in\mathcal{P}\ \wedge\ \Re\{z_\ell\}<0\ \wedge\ |z_\ell|>\eta_{\text{cs}}\,M_{\text{pre}}\\
+  0 & \text{otherwise}
+  \end{cases}.
+\]
+The cycle-slip corrected carrier phase and polarity state are defined by
+\[
+  \theta_{\ell+1}=\mathrm{wrap}_{(-\pi,\pi]}\!\left(\theta_{\ell+1}+\chi_\ell\pi\right),\quad
+  p_{\ell+1}=(-1)^{\chi_\ell}p_\ell.
+\]
+
+Define the frequency-snap state $(\nu_\ell,c_\ell)$ with initialization $(\nu_0,c_0)=(0,0)$, where $\nu_\ell$ is the held bank offset (Hz) and $c_\ell\in\{0,\dots,N_{\text{snap}}\}$ is a consecutive-count state. Let $\Delta f_{\ell}=\Delta f_{h_{\text{best}}}$. The state update is
+\[
+  (\nu'_{\ell+1},c'_{\ell+1})=
+  \begin{cases}
+  (\nu_\ell,\min(c_\ell+1,N_{\text{snap}})) & \mathrm{conf}_{\text{freq}}\ge \mathrm{conf}_{\text{freq,min}}\ \wedge\ \Delta f_{\ell}\neq 0\ \wedge\ |\Delta f_{\ell}-\nu_\ell|\le f_{\text{snap,tol}}\\
+  (\Delta f_{\ell},0) & \text{otherwise}.
+  \end{cases}
+\]
+Define the snap event indicator
+\[
+  \psi_{\ell+1}=\mathbf{1}\{c'_{\ell+1}=N_{\text{snap}}\}.
+\]
+The post-snap frequency state and stored snap state are defined by
+\[
+  \omega_{\ell+1}=\min\!\left(\max\!\left(\omega_{\ell+1}^{(0)}+\psi_{\ell+1}\cdot \mathbf{1}\{|\nu'_{\ell+1}|\ge f_{\text{snap,min}}\}\cdot 2\pi\nu'_{\ell+1}T_{\text{data}},-\omega_{\max}\right),\omega_{\max}\right),
+\]
+\[
+  (\nu_{\ell+1},c_{\ell+1})=
+  \begin{cases}
+  (0,0) & \psi_{\ell+1}=1\\
+  (\nu'_{\ell+1},c'_{\ell+1}) & \psi_{\ell+1}=0
+  \end{cases}.
+\]
+
+Given loop bandwidth $B_L$ (Hz) and damping $\zeta$, define
+\[
+  T_{\text{upd}}=\frac{\mathit{SF}+j_{\text{avg}}}{R_c},\quad j_{\text{avg}}=40+\frac{50}{2},
+\]
+\[
+  \omega_n=2\pi B_L,\quad r=\exp(-\zeta\omega_n T_{\text{upd}}),\quad \phi=\omega_n\sqrt{1-\zeta^2}\,T_{\text{upd}},
+\]
+\[
+  K_p = 1-r^2,\quad K_i = 1+r^2-2r\cos\phi.
+\]
+Fixed PLL values: $B_L=1.0\,\text{Hz}$, $\zeta=0.707$.
+
+\subsubsection{Step C.6: Code Timing Tracking (Early/Late DLL)}
+
+The DLL timing state is $\mathit{step}_\ell$ (samples per $1024$-chip data window) and $\tau_\ell$ (common timing offset, samples). Define
+\[
+  \mathit{step}_{\text{nom}}=\mathit{SF}\cdot \mathit{OSF},\quad
+  \mathit{step}_{\min}=\mathit{step}_{\text{nom}}(1-2000\cdot 10^{-6}),\quad
+  \mathit{step}_{\max}=\mathit{step}_{\text{nom}}(1+2000\cdot 10^{-6}).
+\]
+Define the early/late spacing (samples)
+\[
+  \Delta_{\text{EL}} = 0.5\cdot \mathit{step}_\ell/\mathit{SF}.
+\]
+Define $\Delta_{\text{chip}}=\mathit{step}_\ell/\mathit{SF}$.
+
+Define the early/late sampling instants
+\[
+  p_E=t_{i,\ell}+j\Delta_{\text{chip}}-\Delta_{\text{EL}},\quad
+  p_L=t_{i,\ell}+j\Delta_{\text{chip}}+\Delta_{\text{EL}}.
+\]
+Define
+\[
+  n_E=\lfloor p_E\rfloor,\quad a_E=p_E-n_E\in[0,1),\quad \mathbf{y}_{i,\ell}^{(E)}[j]=(1-a_E)\,y[n_E]+a_E\,y[n_E+1],
+\]
+\[
+  n_L=\lfloor p_L\rfloor,\quad a_L=p_L-n_L\in[0,1),\quad \mathbf{y}_{i,\ell}^{(L)}[j]=(1-a_L)\,y[n_L]+a_L\,y[n_L+1].
+\]
+
+Define the despread, hop-compensated early/late chip vectors
+\[
+  \mathbf{u}_{i,\ell}^{(E)}[j]=b_\ell\cdot \mathbf{y}_{i,\ell}^{(E)}[j]\cdot C_{\text{seq}}[\ell\cdot \mathit{SF}+j]\cdot c_{i,\ell},\quad
+  \mathbf{u}_{i,\ell}^{(L)}[j]=b_\ell\cdot \mathbf{y}_{i,\ell}^{(L)}[j]\cdot C_{\text{seq}}[\ell\cdot \mathit{SF}+j]\cdot c_{i,\ell}.
+\]
+Define the combined early/late vectors using the same weights as the prompt branch:
+\[
+  \mathbf{u}_{\ell}^{(E)}[j]=\sum_i w_{i,\ell}\cdot \mathbf{u}_{i,\ell}^{(E)}[j],\quad
+  \mathbf{u}_{\ell}^{(L)}[j]=\sum_i w_{i,\ell}\cdot \mathbf{u}_{i,\ell}^{(L)}[j].
+\]
+
+Define the carrier-compensated early/late correlator outputs
+\[
+  z_E=
+  \begin{cases}
+  \sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{\ell}^{(E)}[j]\cdot r_{\ell,h_{\text{best}}}[j] & \ell\in\{0,1\}\cup\mathcal{P}\\
+  \sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{\ell}^{(E)}[j]\cdot r_{\ell,h_{\text{best}}}[j]\cdot W_{\hat m_\ell}[j] & \text{otherwise}
+  \end{cases},
+\]
+\[
+  z_L=
+  \begin{cases}
+  \sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{\ell}^{(L)}[j]\cdot r_{\ell,h_{\text{best}}}[j] & \ell\in\{0,1\}\cup\mathcal{P}\\
+  \sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{\ell}^{(L)}[j]\cdot r_{\ell,h_{\text{best}}}[j]\cdot W_{\hat m_\ell}[j] & \text{otherwise}
+  \end{cases}.
+\]
+
+Define
+\[
+  d_\ell=\frac{|z_E|-|z_L|}{|z_E|+|z_L|+\epsilon},\quad
+  e_{\text{DLL},\ell}=d_\ell\cdot\frac{\Delta_{\text{EL}}}{2}.
+\]
+
+Given DLL gains $(K_p^{\text{DLL}},K_i^{\text{DLL}})$ and decision-directed scale
+\[
+  s_{\text{dd}}^{\text{DLL}}=
+  \begin{cases}
+  1.0 & \ell\in\{0,1\}\cup\mathcal{P}\\
+  0.25 & \text{otherwise}
+  \end{cases},
+\]
+define the timing updates
+\[
+  \mathit{step}_{\ell+1}=\min\!\left(\max\!\left(\mathit{step}_\ell - (K_i^{\text{DLL}} s_{\text{dd}}^{\text{DLL}})\,e_{\text{DLL},\ell},\mathit{step}_{\min}\right),\mathit{step}_{\max}\right),
+\]
+\[
+  \Delta t_\ell = -(K_p^{\text{DLL}} s_{\text{dd}}^{\text{DLL}})\,e_{\text{DLL},\ell}.
+\]
+
+Fixed DLL values: $B_L=0.6\,\text{Hz}$, $\zeta=0.707$ with the same pole-mapping definitions as the PLL.
 
 \subsection{Step D: Walsh Demodulation and Polar (CA-SCL) Decoding}
 
 \subsubsection*{1. Pilot-aided Carrier Tracking}
 
-Pilot symbols (known $W_0$) provide a coherent reference for the carrier tracker and channel smoother defined in Step C.2 and Step C.3.
+Pilot symbols (known $W_0$) are the elements of $\mathcal{P}$ and define the known-reference decision statistic $z_\ell$ in Step~C.5 and the channel-gain update in Step~C.4.
 
 \subsubsection*{2. Walsh Matched Filtering (FHT)}
 
-For each data symbol $\ell=\ell_{\text{data}}(q)$ ($q=0,\dots,N_{\text{data}}-1$) and each symbol-rate frequency hypothesis $k$ (selected from the bank in Step C), compute the $M_W$-way correlation on the carrier-compensated chip vector:
+For each data symbol $\ell=\ell_{\text{data}}(q)$ ($q=0,\dots,N_{\text{data}}-1$) and each symbol-rate frequency hypothesis $k$ (from the bank in Step~C.5), the $M_W$-way correlation is defined by
 \[
-  R_{\ell,k}[m]=\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{\ell,k}[j]\cdot W_m[j],\quad m\in[0,255].
+  R_{\ell,k}[m]=\sum_{j=0}^{\mathit{SF}-1}\mathbf{u}_{\ell}[j]\cdot r_{\ell,k}[j]\cdot W_m[j],\quad m\in[0,255].
 \]
-Use a 1024-point Fast Walsh-Hadamard Transform (FHT) to compute the full correlation for $m\in[0,1023]$, and then truncate to the first $M_W$ results for $m\in[0,255]$. Select the hypothesis $k_{\text{best}}$ for this symbol using the peak energy criterion (Step C), and pass $R_{\ell,k_{\text{best}}}[m]$ to the soft-demapper.
+The selected hypothesis is
+\[
+  k_{\text{best}}=\arg\max_k \max_{m\in[0,255]} |R_{\ell,k}[m]|^2,
+\]
+and $R_{\ell,k_{\text{best}}}[m]$ defines the soft-demapping input.
 
 \subsubsection*{3. Soft Information (LLR) Generation}
 
-Apply a decision-directed common phase rotation before soft-demapping to make the decided peak real-positive:
+The decision-directed common phase rotation is defined by
 \[
   \widetilde R_{\ell}[m] = R_{\ell,k_{\text{best}}}[m]\cdot e^{-j\arg\!\left(R_{\ell,k_{\text{best}}}[\hat m_\ell]\right)}.
 \]
@@ -842,13 +974,15 @@ Let the metric be $D_{\ell}[m]=\Re\{\widetilde R_{\ell}[m]\}$. If the decision-d
 \[
   \mathit{LLR}_{qk+t}=\max_{m:\, ((m\gg(k-1-t))\mathbin{\&}1)=0} D_{\ell}[m] - \max_{m:\, ((m\gg(k-1-t))\mathbin{\&}1)=1} D_{\ell}[m].
 \]
-The $N_{\text{data}}\cdot k=M$ LLRs correspond to the interleaved coded bits $B^{(\pi)}$. Apply the inverse permutation to deinterleave them before decoding:
+The $N_{\text{data}}\cdot k=M$ LLRs correspond to the interleaved coded bits $B^{(\pi)}$. The deinterleaved LLRs are defined by the inverse permutation:
 \[
   \mathit{LLR}_i = \mathit{LLR}^{(\pi)}_{\pi^{-1}(i)}.
 \]
 
 \subsubsection*{4. CA-SCL Polar Decoding and Output}
 
-Perform CRC-aided SCL (CA-SCL) Polar decoding on the deinterleaved LLRs to obtain the information bits $\hat{U}$. Use the existing CRC-32C (embedded inside $U$) as the list selection rule: choose the best-metric candidate that passes CRC; if none pass CRC, choose the best-metric candidate. Then perform a final CRC-32C check; if it passes, output $\hat{U}$ and truncate the payload according to the \texttt{Len} field in the Header. If it fails, discard the packet.
+Let $\hat U$ be the information-bit estimate produced by CRC-aided SCL (CA-SCL) Polar decoding of the deinterleaved LLRs. List selection is defined by CRC-32C (embedded inside $U$): among the list candidates, $\hat U$ is the best-metric candidate that satisfies CRC; if no list candidate satisfies CRC, $\hat U$ is the best-metric candidate.
+
+The decode is accepted if $\mathrm{CRC32C}(\hat U)=0$ under the CRC definition in Step~A0. If accepted, the receiver output is the payload extracted from $\hat U$ using the \texttt{Len} field; otherwise the packet is invalid.
 
 \end{document}

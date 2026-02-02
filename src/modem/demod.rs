@@ -331,6 +331,11 @@ impl<'a> SymbolTracker<'a> {
             )
             .ok_or_else(|| anyhow::anyhow!("insufficient_samples"))?;
             Self::demask_in_place(c_seq, p.sf(), 1, &mut y1);
+            // Spec §3.D: preamble symbol 1 is `-W0`, so after de-masking with `C_seq` we flip
+            // the whole symbol to keep preamble symbols coherent with symbol 0.
+            for v in &mut y1 {
+                *v = -*v;
+            }
             u1_fingers.push(y1);
         }
         Ok((u0_fingers, u1_fingers))
@@ -341,7 +346,7 @@ impl<'a> SymbolTracker<'a> {
             .map(|i| {
                 let z0: Complex32 = u0_fingers[i].iter().copied().sum();
                 let z1: Complex32 = u1_fingers[i].iter().copied().sum();
-                z0 - z1
+                z0 + z1
             })
             .collect()
     }
