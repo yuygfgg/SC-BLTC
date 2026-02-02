@@ -77,4 +77,4 @@ cargo run --release --bin tx -- [parameters]
 
 ## References
 
-- See [Specification.pdf](Specification.pdf) for the complete protocol specification
+- See [Specification.tex](Specification.tex) for the complete protocol specification
