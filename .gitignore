@@ -11,5 +11,13 @@ target/
 # Github fails to render Latex, so we upload a PDF instead
 Specification.md
 
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.toc
+
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md
