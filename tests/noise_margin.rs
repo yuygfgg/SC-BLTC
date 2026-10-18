@@ -70,5 +70,7 @@ fn decode_awgn_noise_std_6_single_seed() -> anyhow::Result<()> {
         20,
     )?;
     eprintln!("meta={meta:?}, payload={:?}", payload.as_deref());
+    assert!(meta.crc_ok, "noise_std={noise_std} decode failed: {meta:?}");
+    assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
     Ok(())
 }

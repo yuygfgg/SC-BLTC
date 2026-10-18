@@ -42,6 +42,7 @@ type FingerSamples = Vec<FingerVec>;
 const FREQ_EVIDENCE_DECAY: f64 = 0.95;
 const FREQ_EVIDENCE_MIN_SYMBOLS: usize = 4;
 const FREQ_SNAP_EVIDENCE_MIN: f32 = 0.05;
+const MAX_DEMOD_FINGERS: usize = 3;
 
 struct SymbolBuffers {
     u_p_fingers: Vec<Vec<Complex32>>,
@@ -1053,6 +1054,52 @@ impl ScBltcModem {
         cfo_hz: f64,
         scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
+        if n_offset_total.is_empty() {
+            return Ok((None, DecodeMeta::error("no_offsets")));
+        }
+
+        // Acquisition orders fingers by descending preamble energy and keeps the first
+        // offset as the reference path. Start with that path, then add weaker paths only
+        // when the current decode does not pass CRC.
+        let n_finger = n_offset_total.len().min(MAX_DEMOD_FINGERS);
+        let mut best_fail: Option<(Option<Vec<u8>>, DecodeMeta)> = None;
+        let mut best_score = f32::NEG_INFINITY;
+        for finger_count in 1..=n_finger {
+            let result = self.demod_decode_raw_with_offsets(
+                rx_samples,
+                ti_tx,
+                frame_start_sample,
+                &n_offset_total[..finger_count],
+                cfo_hz,
+                scl_list_size,
+            )?;
+            if result.1.crc_ok {
+                return Ok(result);
+            }
+
+            let score = result.1.verify_score;
+            let better = score.is_finite()
+                && (best_fail.is_none() || score > best_score || !best_score.is_finite());
+            if better {
+                best_score = score;
+                best_fail = Some(result);
+            } else if best_fail.is_none() {
+                best_fail = Some(result);
+            }
+        }
+
+        Ok(best_fail.unwrap_or((None, DecodeMeta::error("insufficient_samples"))))
+    }
+
+    fn demod_decode_raw_with_offsets(
+        &self,
+        rx_samples: &[Complex32],
+        ti_tx: u64,
+        frame_start_sample: usize,
+        n_offset_total: &[isize],
+        cfo_hz: f64,
+        scl_list_size: usize,
+    ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
         let p = &self.p;
         if n_offset_total.is_empty() {
             return Ok((None, DecodeMeta::error("no_offsets")));
@@ -1215,7 +1262,7 @@ impl ScBltcModem {
         let cascade_delay = 2 * self.rrc.delay();
         let frame_start = frame_start_sample as f64;
 
-        let n_finger = n_offset_total.len().min(3);
+        let n_finger = n_offset_total.len().min(MAX_DEMOD_FINGERS);
         let mut tracker = SymbolTracker::new(
             p,
             y,

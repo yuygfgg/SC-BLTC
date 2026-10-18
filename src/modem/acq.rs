@@ -427,9 +427,8 @@ impl ScBltcModem {
         };
 
         let arrival_chunk: usize = 4;
-        (0..n_ti)
-            .into_par_iter()
-            .flat_map_iter(|ti_idx| {
+        let jobs: Vec<(usize, usize, usize)> = (0..n_ti)
+            .flat_map(|ti_idx| {
                 let base = ti_idx * ctx.iv_samples;
                 let half = ctx.arrival_search_half_samples;
                 let arrival_lo = base.saturating_sub(half);
@@ -452,21 +451,22 @@ impl ScBltcModem {
                         )
                     })
             })
-            .map_init(
+            .collect();
+
+        jobs.into_par_iter()
+            .fold(
                 || {
                     (
                         vec![Complex32::new(0.0, 0.0); ctx.nfft],
                         vec![Complex32::new(0.0, 0.0); ctx.scratch_len],
+                        Vec::<Cand>::with_capacity(k_keep),
                     )
                 },
-                |state, (ti_idx, off0, off1)| {
-                    let buf = &mut state.0;
-                    let scratch = &mut state.1;
+                |(mut buf, mut scratch, mut local_topk), (ti_idx, off0, off1)| {
                     let ti = ti_min + (ti_idx as u64);
                     let ref0 = &ctx.ref_pre0_conj_by_ti[ti_idx];
                     let ref1 = &ctx.ref_pre1_conj_by_ti[ti_idx];
                     let delta_sym1 = ctx.pre1_delta_samp_by_ti[ti_idx];
-                    let mut local_topk: Vec<Cand> = Vec::with_capacity(k_keep);
 
                     for arrival_sample in off0..off1 {
                         let y0 = arrival_sample;
@@ -542,9 +542,10 @@ impl ScBltcModem {
                             k_keep,
                         );
                     }
-                    local_topk
+                    (buf, scratch, local_topk)
                 },
             )
+            .map(|(_, _, topk)| topk)
             .reduce(
                 || Vec::with_capacity(k_keep),
                 |mut a, b| {

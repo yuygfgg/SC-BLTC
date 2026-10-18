@@ -115,6 +115,8 @@ The following global parameters are predefined:
   \item Pilot-aided channel-gain smoothing factor: $\alpha_A=\frac{1}{16}$.
   \item Arrival-delay search half-window: $T_{\text{arrival,search}}=4\,\text{ms}$.
   \item DLL early/late spacing: $0.5$ chips. DLL step limit: $\pm 2000\,\mathrm{ppm}$ around the nominal sample step.
+  \item Adaptive RAKE decoding: the receiver tests the ordered RAKE-finger prefixes from one
+    finger up to $N_{\text{finger,max}}$, and stops at the first prefix that passes CRC-32C.
   \end{itemize}
 \end{itemize}
 
@@ -672,6 +674,34 @@ The refined reference arrival is $\hat a_{\text{ref}}(\Delta n^\star)$. The deco
 sample and the relative finger delays for matched filtering and tracking.
 Set $\hat a_{\text{ref}}=\hat a_{\text{ref}}(\Delta n^\star)$ for the remaining receiver steps.
 
+\subsubsection{Step C.1.1: Adaptive RAKE Finger Trials}
+
+The acquisition result orders the selected finger arrivals by descending correlation energy.
+The first arrival is the reference path. Define the number of available trial fingers as
+
+\[
+  N_{\text{trial}}=\min\left(N_{\text{finger,max}},N_{\text{finger,sel}}\right).
+\]
+
+For each $r=1,\dots,N_{\text{trial}}$, define the ordered prefix
+
+\[
+  \mathcal{F}_r=\{\hat a_0,\hat a_1,\dots,\hat a_{r-1}\}.
+\]
+
+The receiver executes the timing refinement in Step~C.1 and Steps~C.2--D for $\mathcal{F}_r$,
+including the timing-refinement shift set $\Delta\mathcal{N}$. The receiver starts with $r=1$.
+If one or more timing shifts
+pass CRC-32C, the receiver selects the first valid shift under the rank $\rho$ rule and
+accepts that decode. The receiver does not test a larger prefix after a CRC-valid decode.
+
+If every timing shift for the current prefix fails CRC-32C, the receiver records the failure
+with the largest verification statistic $V(\Delta n)$ for that prefix and tests the next
+prefix. If all prefixes fail, the receiver returns the recorded failure with the largest
+verification statistic across prefixes. Ties use the smaller prefix size, then the smaller
+timing rank $\rho(\Delta n)$. Each prefix trial starts the matched-filter, tracking, and
+decoder state from the initial state defined in Steps~C.2--D.
+
 \subsubsection{Step C.2: CFO Derotation, De-hopping, and Matched Filtering}
 
 Define the CFO-derotated sequence
@@ -708,9 +738,9 @@ The RRC group delay is $D_{\text{rrc}}$ samples and the cascade group delay is $
 
 \subsubsection{Step C.3: RAKE Geometry and Windowing}
 
-Let $N_{\text{finger,sel}}$ be the number of acquired finger positions and define
+For the current trial prefix $\mathcal{F}_r$, define
 \[
-  N_{\text{finger}}=\min(N_{\text{finger,max}}, N_{\text{finger,sel}}).
+  N_{\text{finger}}=r.
 \]
 Define the per-finger signed delay (samples) relative to the receiver-selected reference path:
 \[
