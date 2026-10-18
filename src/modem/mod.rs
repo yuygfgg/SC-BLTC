@@ -33,23 +33,23 @@ pub struct TxFrame {
     pub samples: Vec<Complex32>,
 }
 
-/// Result of blind acquisition (time index + offset + CFO + multipath fingers).
+/// Result of blind acquisition (time index + arrival sample + CFO + multipath fingers).
 #[derive(Clone, Debug)]
 pub struct AcqResult {
     /// Estimated transmit `TimeIndex` seed (`TI_tx`).
     pub ti_hat: u64,
-    /// Nominal frame-start offset (>=0) from the start of the acquired IV epoch `ti_hat`.
+    /// Receiver sample index of the selected reference arrival path, relative to the acquisition
+    /// window start.
     ///
-    /// The offset is always smaller than the sample count for one IV epoch, so the frame start
-    /// remains inside the 1 ms interval represented by `ti_hat`.
-    pub n0: usize,
+    /// `ti_hat` selects the spreading-code seed; `arrival_sample` selects the receiver sample
+    /// where the reference path arrives.
+    pub arrival_sample: usize,
     /// Estimated CFO in Hz (coarse+refined).
     pub cfo_hat_hz: f64,
-    /// RAKE finger start offsets (>=0) in the same coordinate system as `n0`.
+    /// RAKE finger delays in receiver samples relative to `arrival_sample`.
     ///
-    /// The first offset is the nominal frame start. Later offsets may exceed one IV epoch when
-    /// they represent delayed multipath paths.
-    pub finger_offsets: Vec<usize>,
+    /// The first offset is always zero. Other paths can be earlier or later than the reference.
+    pub finger_offsets: Vec<isize>,
     /// Verification statistic (larger is better).
     pub p_max: f32,
 }

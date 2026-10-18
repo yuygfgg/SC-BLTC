@@ -93,7 +93,7 @@ impl ScBltcModem {
                     s.push(c_seq[seg0 + j] as f32);
                 }
             } else {
-                let m_q = m[q] as u16;
+                let m_q = m[q];
                 for j in 0..p.sf() {
                     let w = walsh_sign(m_q, j);
                     s.push((w as f32) * (c_seq[seg0 + j] as f32));

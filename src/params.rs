@@ -61,6 +61,8 @@ pub struct Params {
     gamma_hybrid_mult: f64,
     /// RAKE finger search half window (seconds, Specification §4.B.3 / §4.C.1).
     rake_search_half_s: f64,
+    /// Arrival-delay search half window (seconds, Specification §4.B.1).
+    arrival_search_half_s: f64,
 
     /// Frequency-hopping bandwidth `BW_hop` (Hz).
     ///
@@ -110,6 +112,7 @@ impl Default for Params {
             cfo_search_hz: 8000.0,
             gamma_hybrid_mult: 10.0,
             rake_search_half_s: 0.004,
+            arrival_search_half_s: 0.004,
 
             hop_bw_hz: 8000.0,
             jitter_min_chips: 40,
@@ -207,6 +210,10 @@ impl Params {
 
     pub fn rake_search_half_s(&self) -> f64 {
         self.rake_search_half_s
+    }
+
+    pub fn arrival_search_half_s(&self) -> f64 {
+        self.arrival_search_half_s
     }
 
     /// Hop bandwidth `BW_hop` (Hz).

@@ -2,7 +2,7 @@
 //!
 //! The receiver does not know the transmit `TimeIndex` (`TI_tx`), so acquisition searches over:
 //! - `TI_search` in a time window `[ti_min .. ti_min + n_ti)`
-//! - intra-epoch sample offset `off` in `[0 .. iv_samples)`
+//! - receiver arrival sample in the available acquisition window
 //! - CFO in a limited band using an FFT peak search
 //!
 //! Coarse stage:
@@ -20,7 +20,7 @@
 //! ```text
 //! rx_window = [ IV(ti_min) | IV(ti_min+1) | ... ]
 //! base(ti)  = (ti - ti_min) * iv_samples
-//! start     = base(ti) + off, where `off` is restricted to `[0 .. iv_samples)`
+//! arrival   = a receiver sample searched around `base(ti)`
 //! ```
 
 use super::{AcqResult, ScBltcModem};
@@ -30,10 +30,12 @@ use num_complex::Complex32;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 
+const RAKE_MIN_ENERGY_RATIO: f64 = 0.25;
+
 #[derive(Clone, Copy, Debug)]
 struct Cand {
     ti: u64,
-    off: usize,
+    arrival_sample: usize,
     p_max: f32,
     f_hat: f64,
 }
@@ -42,7 +44,7 @@ fn cand_better(a: Cand, b: Cand) -> bool {
     match a.p_max.partial_cmp(&b.p_max).unwrap_or(Ordering::Equal) {
         Ordering::Greater => true,
         Ordering::Less => false,
-        Ordering::Equal => (a.ti, a.off) < (b.ti, b.off),
+        Ordering::Equal => (a.ti, a.arrival_sample) < (b.ti, b.arrival_sample),
     }
 }
 
@@ -62,8 +64,131 @@ fn push_topk(topk: &mut Vec<Cand>, cand: Cand, k_keep: usize) {
     }
 }
 
+#[derive(Clone, Debug)]
+struct RakeSelection {
+    energy: f64,
+    items: Vec<(usize, f64)>,
+}
+
+impl RakeSelection {
+    fn with_item(arrival: usize, energy: f64) -> Self {
+        Self {
+            energy,
+            items: vec![(arrival, energy)],
+        }
+    }
+
+    fn add_item(&self, arrival: usize, energy: f64) -> Self {
+        let mut items = self.items.clone();
+        items.push((arrival, energy));
+        Self {
+            energy: self.energy + energy,
+            items,
+        }
+    }
+
+    fn ordered_arrivals(&self) -> Vec<usize> {
+        let mut items = self.items.clone();
+        items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        items.into_iter().map(|(arrival, _)| arrival).collect()
+    }
+}
+
+fn rake_selection_better(a: &RakeSelection, b: &RakeSelection) -> bool {
+    match a.energy.total_cmp(&b.energy) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => a.ordered_arrivals() < b.ordered_arrivals(),
+    }
+}
+
+/// Maximize total correlation energy under the separation and cardinality constraints.
+///
+/// The strongest arrival is mandatory because it is the reference path. The remaining
+/// candidates form a one-dimensional weighted independent-set problem, which this dynamic
+/// program solves exactly instead of stopping at the first `want` greedy candidates.
+fn select_rake_fingers(
+    corr: &[(usize, f64)],
+    strongest: (usize, f64),
+    min_sep: usize,
+    want: usize,
+    min_energy: f64,
+) -> Vec<usize> {
+    if want <= 1 {
+        return vec![strongest.0];
+    }
+
+    let mut candidates: Vec<(usize, f64)> = corr
+        .iter()
+        .copied()
+        .filter(|&(arrival, energy)| {
+            arrival != strongest.0
+                && energy >= min_energy
+                && arrival.abs_diff(strongest.0) >= min_sep
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| candidate.0);
+
+    let max_extra = want - 1;
+    let mut dp: Vec<Vec<Option<RakeSelection>>> =
+        vec![vec![None; max_extra + 1]; candidates.len() + 1];
+    dp[0][0] = Some(RakeSelection {
+        energy: 0.0,
+        items: Vec::new(),
+    });
+    for i in 0..candidates.len() {
+        let current_row = dp[i].clone();
+        for (count, current) in current_row.into_iter().enumerate() {
+            if let Some(current) = current {
+                let replace = dp[i + 1][count]
+                    .as_ref()
+                    .map(|old| rake_selection_better(&current, old))
+                    .unwrap_or(true);
+                if replace {
+                    dp[i + 1][count] = Some(current);
+                }
+            }
+        }
+
+        let prev = candidates[..i]
+            .iter()
+            .rposition(|&(arrival, _)| arrival + min_sep <= candidates[i].0)
+            .map(|j| j + 1)
+            .unwrap_or(0);
+        for count in 1..=max_extra {
+            let Some(previous) = dp[prev][count - 1].clone() else {
+                continue;
+            };
+            let candidate = previous.add_item(candidates[i].0, candidates[i].1);
+            let replace = dp[i + 1][count]
+                .as_ref()
+                .map(|old| rake_selection_better(&candidate, old))
+                .unwrap_or(true);
+            if replace {
+                dp[i + 1][count] = Some(candidate);
+            }
+        }
+    }
+
+    let strongest_selection = RakeSelection::with_item(strongest.0, strongest.1);
+    let mut best = strongest_selection.clone();
+    for extra in dp[candidates.len()].iter().take(max_extra + 1).flatten() {
+        let mut combined = strongest_selection.clone();
+        combined.energy = strongest.1 + extra.energy;
+        combined.items.extend_from_slice(&extra.items);
+        if rake_selection_better(&combined, &best) {
+            best = combined;
+        }
+    }
+
+    best.items
+        .sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    best.items.into_iter().map(|(arrival, _)| arrival).collect()
+}
+
 struct AcqContext {
     iv_samples: usize,
+    arrival_search_half_samples: usize,
     rake_search_half_samples: usize,
     l_sym: usize,
     /// Length (samples) of a single preamble data segment (SF * OSF).
@@ -157,6 +282,11 @@ impl ScBltcModem {
         }
         let rake_search_half_samples =
             ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
+        if p.arrival_search_half_s() < 0.0 {
+            anyhow::bail!("invalid arrival_search_half_s");
+        }
+        let arrival_search_half_samples =
+            ((p.fs_hz() as f64) * p.arrival_search_half_s()).round() as usize;
 
         let l_sym = p.chip_samples();
         let n_ref_pre0 = l_sym;
@@ -181,6 +311,7 @@ impl ScBltcModem {
         let frame_max = p.frame_max_samples_with_jitter();
         let need = n_ti
             .checked_mul(iv_samples)
+            .and_then(|v| v.checked_add(arrival_search_half_samples))
             .and_then(|v| v.checked_add(rake_search_half_samples))
             .and_then(|v| v.checked_add(frame_max))
             .and_then(|v| v.checked_add(32))
@@ -259,6 +390,7 @@ impl ScBltcModem {
 
         Ok(AcqContext {
             iv_samples,
+            arrival_search_half_samples,
             rake_search_half_samples,
             l_sym,
             n_ref_pre0,
@@ -294,13 +426,31 @@ impl ScBltcModem {
             }
         };
 
-        let off_chunk: usize = 4;
+        let arrival_chunk: usize = 4;
         (0..n_ti)
             .into_par_iter()
             .flat_map_iter(|ti_idx| {
-                (0..ctx.iv_samples)
-                    .step_by(off_chunk)
-                    .map(move |off0| (ti_idx, off0, (off0 + off_chunk).min(ctx.iv_samples)))
+                let base = ti_idx * ctx.iv_samples;
+                let half = ctx.arrival_search_half_samples;
+                let arrival_lo = base.saturating_sub(half);
+                let arrival_hi = base
+                    .saturating_add(ctx.iv_samples)
+                    .saturating_add(half)
+                    .min(
+                        rx_window
+                            .len()
+                            .saturating_sub(ctx.n_ref_pre0)
+                            .saturating_sub(ctx.pre1_delta_samp_by_ti[ti_idx]),
+                    );
+                (arrival_lo..=arrival_hi)
+                    .step_by(arrival_chunk)
+                    .map(move |a0| {
+                        (
+                            ti_idx,
+                            a0,
+                            (a0 + arrival_chunk).min(arrival_hi.saturating_add(1)),
+                        )
+                    })
             })
             .map_init(
                 || {
@@ -313,14 +463,13 @@ impl ScBltcModem {
                     let buf = &mut state.0;
                     let scratch = &mut state.1;
                     let ti = ti_min + (ti_idx as u64);
-                    let base = ti_idx * ctx.iv_samples;
                     let ref0 = &ctx.ref_pre0_conj_by_ti[ti_idx];
                     let ref1 = &ctx.ref_pre1_conj_by_ti[ti_idx];
                     let delta_sym1 = ctx.pre1_delta_samp_by_ti[ti_idx];
                     let mut local_topk: Vec<Cand> = Vec::with_capacity(k_keep);
 
-                    for off in off0..off1 {
-                        let y0 = base + off;
+                    for arrival_sample in off0..off1 {
+                        let y0 = arrival_sample;
                         let y1 = y0 + delta_sym1;
 
                         // Two-symbol sparse preamble window (sym0, zeros(GI), sym1).
@@ -386,7 +535,7 @@ impl ScBltcModem {
                             &mut local_topk,
                             Cand {
                                 ti,
-                                off,
+                                arrival_sample,
                                 p_max,
                                 f_hat,
                             },
@@ -515,8 +664,7 @@ impl ScBltcModem {
                     let ref_rot = &mut state.1;
 
                     let ti_idx = (cand.ti - ti_min) as usize;
-                    let base = ti_idx * ctx.iv_samples;
-                    let y0 = base + cand.off;
+                    let y0 = cand.arrival_sample;
 
                     let ref0 = &ctx.ref_pre0_conj_by_ti[ti_idx];
                     let ref1 = &ctx.ref_pre1_conj_by_ti[ti_idx];
@@ -603,7 +751,7 @@ impl ScBltcModem {
                     Ordering::Greater => a,
                     Ordering::Less => b,
                     Ordering::Equal => {
-                        if (a.0.ti, a.0.off) <= (b.0.ti, b.0.off) {
+                        if (a.0.ti, a.0.arrival_sample) <= (b.0.ti, b.0.arrival_sample) {
                             a
                         } else {
                             b
@@ -626,7 +774,6 @@ impl ScBltcModem {
     ) -> anyhow::Result<AcqResult> {
         let p = &self.p;
         let best_ti_idx = (best.ti - ti_min) as usize;
-        let base = best_ti_idx * ctx.iv_samples;
         let ref_pre0_conj = &ctx.ref_pre0_conj_by_ti[best_ti_idx];
         let mut ref_pre0_rot = vec![Complex32::new(0.0, 0.0); ctx.n_ref_pre0];
         {
@@ -656,20 +803,19 @@ impl ScBltcModem {
             }
         }
 
-        // Spec §4.B.3
-        // Coordinate system note: all `off`/`n0`/`finger_offsets` values are nonnegative sample
-        // offsets from the start of the acquired IV epoch (the `ti_hat` boundary). The nominal
-        // frame start `n0` must stay in that epoch. The symmetric search window is clipped to
-        // `[0, max_off]` at the low end; a delayed multipath finger may extend beyond the epoch.
-        let center = best.off as isize;
+        // Spec §4.B.3. Search around the receiver's coarse arrival sample.
+        let center = best.arrival_sample as isize;
         let half = ctx.rake_search_half_samples as isize;
         let mut off_lo: isize = center - half;
         if off_lo < 0 {
             off_lo = 0;
         }
         let mut off_hi: isize = center + half;
-        let max_start = rx_window.len().saturating_sub(ctx.n_ref_pre0);
-        let max_off = max_start.saturating_sub(base) as isize;
+        let max_start = rx_window
+            .len()
+            .saturating_sub(ctx.pre1_delta_samp_by_ti[best_ti_idx])
+            .saturating_sub(ctx.n_ref_pre0);
+        let max_off = max_start as isize;
         if off_hi > max_off {
             off_hi = max_off;
         }
@@ -683,7 +829,7 @@ impl ScBltcModem {
                     .into_par_iter()
                     .map(|i| {
                         let off = (off_lo as usize) + i;
-                        let y0 = base + off;
+                        let y0 = off;
                         let mut e = self.corr_energy_no_cfo(rx_window, y0, &ref_pre0_rot[..]);
                         let y1 = y0.saturating_add(delta_sym1);
                         if y1 + ref_pre1_rot.len() <= rx_window.len() {
@@ -695,7 +841,7 @@ impl ScBltcModem {
             } else {
                 corr = Vec::with_capacity(n_hyp);
                 for off in (off_lo as usize)..=(off_hi as usize) {
-                    let y0 = base + off;
+                    let y0 = off;
                     let mut e = self.corr_energy_no_cfo(rx_window, y0, &ref_pre0_rot[..]);
                     let y1 = y0.saturating_add(delta_sym1);
                     if y1 + ref_pre1_rot.len() <= rx_window.len() {
@@ -708,39 +854,30 @@ impl ScBltcModem {
         // Sort by descending correlation energy, tie-break by smaller offset.
         corr.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        // `best.off` is an intra-epoch hypothesis, so the nominal frame start must stay in
-        // the same IV interval as `best.ti`.  The timing window may also contain delayed paths
-        // from a later interval; those paths can be RAKE fingers, but they cannot become the
-        // frame start for this TimeIndex.
-        let epoch_last = ctx.iv_samples.saturating_sub(1);
-        let n0 = corr
-            .iter()
-            .find(|(off, _)| *off <= epoch_last)
-            .map(|v| v.0)
-            .unwrap_or(best.off.min(epoch_last));
-        debug_assert!(n0 <= epoch_last);
-
+        let strongest = corr.first().map(|v| v.0).unwrap_or(best.arrival_sample);
         let min_sep = (p.osf() as usize).max(1);
-        // Keep the best (strongest) finger first; downstream code treats this as the frame's
-        // nominal start for de-hopping and symbol scheduling.
-        let mut finger_offsets: Vec<usize> = vec![n0];
-        for (off, _) in &corr {
-            // Multipath delays are nonnegative relative to the strongest preamble peak.
-            if *off < n0 {
-                continue;
-            }
-            if finger_offsets.iter().all(|&x| x.abs_diff(*off) >= min_sep) {
-                finger_offsets.push(*off);
-            }
-            if finger_offsets.len() >= want {
-                break;
-            }
-        }
-        // Do not sort: preserve `n0` as the first element.
+        // Select strong, separated arrivals. Use the strongest selected path as the receiver
+        // reference; every other path is represented by its signed relative delay.
+        let min_energy = corr
+            .first()
+            .map(|v| v.1 * RAKE_MIN_ENERGY_RATIO)
+            .unwrap_or(0.0);
+        let selected = select_rake_fingers(
+            &corr,
+            (strongest, corr.first().map(|v| v.1).unwrap_or(0.0)),
+            min_sep,
+            want,
+            min_energy,
+        );
+        let reference = strongest;
+        let finger_offsets: Vec<isize> = selected
+            .iter()
+            .map(|&arrival| arrival as isize - reference as isize)
+            .collect();
 
         Ok(AcqResult {
             ti_hat: best.ti,
-            n0,
+            arrival_sample: reference,
             cfo_hat_hz: f_fine,
             finger_offsets,
             p_max: best.p_max,
@@ -771,7 +908,7 @@ impl ScBltcModem {
     ///
     /// `rx_raw_window` must contain `n_ti` consecutive IV intervals plus enough guard samples for:
     /// - candidate verification (preamble + pilots)
-    /// - RAKE finger search around the best preamble offset
+    /// - RAKE finger search around the best receiver arrival sample
     pub fn acquire_fft_raw_window(
         &self,
         rx_raw_window: &[Complex32],
@@ -780,5 +917,17 @@ impl ScBltcModem {
         n_finger: usize,
     ) -> anyhow::Result<Option<AcqResult>> {
         self.acquire_fft_window_impl(rx_raw_window, ti_min, n_ti, n_finger)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_rake_fingers;
+
+    #[test]
+    fn rake_selection_maximizes_total_energy() {
+        let corr = vec![(100, 400.0), (130, 300.0), (120, 250.0), (140, 250.0)];
+        let selected = select_rake_fingers(&corr, (100, 400.0), 20, 4, 100.0);
+        assert_eq!(selected, vec![100, 120, 140]);
     }
 }

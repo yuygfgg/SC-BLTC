@@ -4,6 +4,7 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use sc_bltc::modem::ScBltcModem;
 use sc_bltc::params::Params;
+use sc_bltc::sim::channel::resample_linear;
 
 fn apply_ou_doppler_and_awgn(
     x: &[Complex32],
@@ -74,7 +75,8 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
     let pre = base + n0_true;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let pad_post = 512usize; // extra samples so interpolation never runs off the end
     let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_frame.samples.len() + pad_post];
@@ -98,12 +100,12 @@ fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
 
     assert_eq!(acq.ti_hat, ti_tx);
     assert!(
-        (acq.n0 as isize - n0_true as isize).abs() <= 3,
+        (acq.arrival_sample as isize - (base + n0_true) as isize).abs() <= 3,
         "acq={acq:?}"
     );
 
     // Demod using acquisition outputs.
-    let frame_start_sample = base; // epoch start; add n0 via offsets
+    let frame_start_sample = acq.arrival_sample;
     let (payload, meta) = modem.demod_decode_raw(
         &raw,
         ti_tx,
@@ -137,7 +139,8 @@ fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
     let pre = base + n0_true;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let pad_post = 512usize;
     let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_frame.samples.len() + pad_post];
@@ -152,8 +155,14 @@ fn test_decode_with_doppler_ou_no_noise() -> anyhow::Result<()> {
         .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
-    let (payload, meta) =
-        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, acq.cfo_hat_hz, 20)?;
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        20,
+    )?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
@@ -179,7 +188,8 @@ fn test_decode_awgn_only() -> anyhow::Result<()> {
     let pre = base + n0_true;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let pad_post = 512usize;
     let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_frame.samples.len() + pad_post];
@@ -194,8 +204,14 @@ fn test_decode_awgn_only() -> anyhow::Result<()> {
         .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
 
-    let (payload, meta) =
-        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, acq.cfo_hat_hz, 20)?;
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        20,
+    )?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
@@ -221,7 +237,8 @@ fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
     let pre = base + n0_true;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let pad_post = 512usize;
     let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_frame.samples.len() + pad_post];
@@ -239,8 +256,14 @@ fn test_decode_with_constant_cfo_no_noise() -> anyhow::Result<()> {
 
     assert!((acq.cfo_hat_hz - cfo_hz).abs() < 1.0, "acq={acq:?}");
 
-    let (payload, meta) =
-        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, acq.cfo_hat_hz, 20)?;
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        20,
+    )?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
@@ -266,7 +289,8 @@ fn test_decode_with_constant_cfo_without_derotation() -> anyhow::Result<()> {
     let pre = base + n0_true;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let pad_post = 512usize;
     let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_frame.samples.len() + pad_post];
@@ -284,10 +308,68 @@ fn test_decode_with_constant_cfo_without_derotation() -> anyhow::Result<()> {
 
     // Intentionally do NOT derotate with the coarse CFO estimate; force the symbol-rate loop
     // to handle it.
-    let (payload, meta) =
-        modem.demod_decode_raw(&raw, ti_tx, base, &acq.finger_offsets, 0.0, 50)?;
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        0.0,
+        50,
+    )?;
 
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"test".as_slice()));
+    Ok(())
+}
+
+#[test]
+fn test_decode_with_sampling_rate_offset() -> anyhow::Result<()> {
+    let p = Params::default();
+    let key = [0u8; 32];
+    let modem = ScBltcModem::new(p, key)?;
+
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
+    let n0_true = 4usize;
+    let t_tx = 4000.0f64 + (n0_true as f64) / fs;
+    let tx_frame = modem.build_frame_samples(b"sro", 1, 1, Some(t_tx))?;
+    let ti_tx = tx_frame.ti_tx;
+    let sro_ppm = 100.0;
+    let sample_rate_ratio = 1.0 + sro_ppm * 1e-6;
+    let tx_samples = resample_linear(&tx_frame.samples, sample_rate_ratio)?;
+    assert!(tx_samples.len() > tx_frame.samples.len());
+
+    let ti_min = ti_tx.saturating_sub(2);
+    let n_ti = 5usize;
+    let base = ((ti_tx - ti_min) as usize) * iv_samples;
+    let pre = base + n0_true;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_samples.len() + 512];
+    raw[pre..pre + tx_samples.len()].copy_from_slice(&tx_samples);
+    if raw.len() < win_need {
+        raw.resize(win_need, Complex32::new(0.0, 0.0));
+    }
+
+    let acq = modem
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
+        .ok_or_else(|| anyhow::anyhow!("acq_failed at sro_ppm={sro_ppm}"))?;
+    assert_eq!(acq.ti_hat, ti_tx);
+    assert!(
+        (acq.arrival_sample as isize - (base + n0_true) as isize).abs() <= 20,
+        "acq={acq:?}"
+    );
+
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        20,
+    )?;
+    assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
+    assert_eq!(payload.as_deref(), Some(b"sro".as_slice()));
     Ok(())
 }

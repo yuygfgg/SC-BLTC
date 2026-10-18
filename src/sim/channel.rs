@@ -16,6 +16,41 @@
 use anyhow::Context;
 use num_complex::Complex32;
 
+/// Resample a nominal-rate waveform for a transmitter clock with a different rate.
+///
+/// `ratio` is `F_s_actual / F_s_nominal`. The output is sampled at the actual clock,
+/// while the input samples describe the same waveform at the nominal clock. Linear
+/// interpolation keeps the waveform phase continuous across the fractional sample
+/// positions introduced by the clock offset.
+pub fn resample_linear(input: &[Complex32], ratio: f64) -> anyhow::Result<Vec<Complex32>> {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        anyhow::bail!("sample-rate ratio must be finite and positive");
+    }
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ratio == 1.0 || input.len() == 1 {
+        return Ok(input.to_vec());
+    }
+
+    let last = (input.len() - 1) as f64;
+    let output_last = last * ratio;
+    if !output_last.is_finite() || output_last >= (usize::MAX - 1) as f64 {
+        anyhow::bail!("resampled waveform is too large");
+    }
+    let output_len = output_last.floor() as usize + 1;
+    let mut output = Vec::with_capacity(output_len);
+    for n in 0..output_len {
+        let source_pos = (n as f64) / ratio;
+        let source_idx = (source_pos.floor() as usize).min(input.len() - 1);
+        let frac = (source_pos - source_idx as f64) as f32;
+        let x0 = input[source_idx];
+        let x1 = input.get(source_idx + 1).copied().unwrap_or(x0);
+        output.push(x0 + (x1 - x0) * frac);
+    }
+    Ok(output)
+}
+
 /// A tiny deterministic RNG.
 ///
 /// This is used for reproducible simulations; it is not cryptographically secure.
@@ -297,4 +332,36 @@ pub fn apply_channel_sample(
         y += Complex32::new(nr, ni);
     }
     y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resample_linear;
+    use num_complex::Complex32;
+
+    #[test]
+    fn resample_linear_interpolates_and_scales_length() -> anyhow::Result<()> {
+        let input = [
+            Complex32::new(0.0, 0.0),
+            Complex32::new(2.0, -2.0),
+            Complex32::new(4.0, -4.0),
+        ];
+        let output = resample_linear(&input, 2.0)?;
+
+        assert_eq!(output.len(), 5);
+        assert_eq!(output[0], input[0]);
+        assert_eq!(output[2], input[1]);
+        assert_eq!(output[4], input[2]);
+        assert_eq!(output[1], Complex32::new(1.0, -1.0));
+        assert_eq!(output[3], Complex32::new(3.0, -3.0));
+        Ok(())
+    }
+
+    #[test]
+    fn resample_linear_accepts_identity_and_rejects_invalid_rates() {
+        let input = [Complex32::new(1.0, 2.0)];
+        assert_eq!(resample_linear(&input, 1.0).unwrap(), input);
+        assert!(resample_linear(&input, 0.0).is_err());
+        assert!(resample_linear(&input, f64::NAN).is_err());
+    }
 }

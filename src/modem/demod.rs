@@ -2,8 +2,8 @@
 //!
 //! Given:
 //! - an acquired `ti_tx` (spreading seed)
-//! - a start sample index for the acquired IV epoch
-//! - one or more RAKE finger offsets within that epoch
+//! - the receiver sample index of a selected reference arrival path
+//! - one or more RAKE finger delays relative to that path
 //!
 //! This module:
 //! 1) generates the full-frame chip mask `C_seq`
@@ -36,6 +36,12 @@ use std::cmp::Ordering;
 
 type FingerVec = Vec<Complex32>;
 type FingerSamples = Vec<FingerVec>;
+
+// A 0.25 Hz bank step is deliberately accumulated over symbols. Adjacent candidates
+// differ by less than one percent over a single 204.8 ms data window.
+const FREQ_EVIDENCE_DECAY: f64 = 0.95;
+const FREQ_EVIDENCE_MIN_SYMBOLS: usize = 4;
+const FREQ_SNAP_EVIDENCE_MIN: f32 = 0.05;
 
 struct SymbolBuffers {
     u_p_fingers: Vec<Vec<Complex32>>,
@@ -75,8 +81,8 @@ struct DllUpdate {
 }
 
 struct SymbolProcOutcome {
-    freq_conf: f32,
-    best_dhz: f64,
+    freq_evidence: f32,
+    best_freq_hz: f64,
     dll_update: Option<DllUpdate>,
 }
 
@@ -103,20 +109,27 @@ struct SymbolTracker<'a> {
     bank_dhz: Vec<f64>,
     bank_domega: Vec<f64>,
     bank_step_hz: f64,
+    freq_likelihood: Vec<f64>,
+    /// Absolute-frequency center represented by `freq_likelihood`.
+    ///
+    /// The PLL center can move between symbols. Keeping this center lets us
+    /// regrid historical evidence before adding the next symbol's metrics.
+    freq_likelihood_center_hz: f64,
+    freq_evidence_symbols: usize,
     snap_cand_hz: Option<f64>,
     snap_count: usize,
     freq_snap_confirm: usize,
     freq_snap_min_abs_hz: f64,
     alpha_ch: f64,
     el_spacing_chips: f64,
-    // Spec §4.C: verification statistic for n0 refinement (preamble + pilots).
+    // Spec §4.C: verification statistic for arrival-sample refinement (preamble + pilots).
     verify_pre: f64,
     verify_pilot: f64,
     buffers: SymbolBuffers,
 }
 
 struct TrackerTiming<'a> {
-    n_offset_total: &'a [usize],
+    n_offset_total: &'a [isize],
     frame_start: f64,
     cascade_delay: usize,
 }
@@ -186,6 +199,7 @@ impl<'a> SymbolTracker<'a> {
         let omega = 0.0f64;
 
         let (bank_dhz, bank_domega, bank_step_hz) = Self::init_freq_bank(t_data);
+        let bank_len = bank_dhz.len();
         let pre_mag_ref = Self::preamble_mag_ref(p, n_finger, &u0_fingers, &w_mrc, theta);
         let alpha_ch = 1.0 / (p.n_pilot() as f64);
         let verify_pre: f64 = pre_corr.iter().map(|z| z.norm_sqr() as f64).sum();
@@ -212,6 +226,9 @@ impl<'a> SymbolTracker<'a> {
             bank_dhz,
             bank_domega,
             bank_step_hz,
+            freq_likelihood: vec![0.0; bank_len],
+            freq_likelihood_center_hz: 0.0,
+            freq_evidence_symbols: 0,
             snap_cand_hz: None,
             snap_count: 0,
             freq_snap_confirm: 3,
@@ -224,7 +241,7 @@ impl<'a> SymbolTracker<'a> {
         })
     }
 
-    fn init_finger_delays_samp(n_offset_total: &[usize], n_finger: usize) -> Vec<i32> {
+    fn init_finger_delays_samp(n_offset_total: &[isize], n_finger: usize) -> Vec<i32> {
         let n = n_finger.min(n_offset_total.len());
         if n == 0 {
             return Vec::new();
@@ -276,7 +293,7 @@ impl<'a> SymbolTracker<'a> {
     }
 
     fn init_symbol_times(
-        n_offset_total: &[usize],
+        n_offset_total: &[isize],
         n_finger: usize,
         frame_start: f64,
         cascade_delay: usize,
@@ -466,7 +483,9 @@ impl<'a> SymbolTracker<'a> {
         }
     }
 
-    fn best_and_conf_mag(r_all: &[Complex32], mw: usize) -> (usize, f32) {
+    // The adjacent-codeword margin still gates data decisions. Frequency confidence
+    // uses the cross-symbol likelihood accumulator below.
+    fn best_code_and_conf_mag(r_all: &[Complex32], mw: usize) -> (usize, f32) {
         let mut best_i = 0usize;
         let mut best_v = f32::NEG_INFINITY;
         let mut second = f32::NEG_INFINITY;
@@ -482,6 +501,115 @@ impl<'a> SymbolTracker<'a> {
         }
         let conf = (best_v - second) / (best_v.abs() + 1e-18);
         (best_i, conf)
+    }
+
+    fn accumulate_frequency_likelihood(
+        likelihood: &mut [f64],
+        evidence_symbols: &mut usize,
+        bank_dhz: &[f64],
+        metrics: &[f32],
+    ) -> (f32, f64) {
+        debug_assert_eq!(metrics.len(), likelihood.len());
+        debug_assert_eq!(bank_dhz.len(), likelihood.len());
+        if metrics.len() != likelihood.len() || bank_dhz.len() != likelihood.len() {
+            return (0.0, 0.0);
+        }
+
+        let peak = metrics
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .fold(0.0f32, f32::max);
+        if peak <= 0.0 {
+            return (0.0, 0.0);
+        }
+
+        *evidence_symbols = (*evidence_symbols).saturating_add(1);
+        for (acc, &metric) in likelihood.iter_mut().zip(metrics) {
+            // Normalize within this symbol so the memory tracks relative frequency
+            // likelihood instead of absolute channel power.
+            let normalized = if metric.is_finite() && metric >= 0.0 {
+                (metric / peak).clamp(0.0, 1.0) as f64
+            } else {
+                0.0
+            };
+            *acc = FREQ_EVIDENCE_DECAY * *acc + normalized;
+        }
+
+        let mut best_i = 0usize;
+        let mut best_v = f64::NEG_INFINITY;
+        let mut second = f64::NEG_INFINITY;
+        for (i, &score) in likelihood.iter().enumerate() {
+            if score > best_v {
+                second = best_v;
+                best_v = score;
+                best_i = i;
+            } else if score > second {
+                second = score;
+            }
+        }
+        let evidence = if *evidence_symbols >= FREQ_EVIDENCE_MIN_SYMBOLS {
+            (best_v - second).max(0.0) as f32
+        } else {
+            0.0
+        };
+        (evidence, bank_dhz[best_i])
+    }
+
+    fn rebase_frequency_likelihood(&mut self) {
+        let center_hz = self.omega / (2.0 * std::f64::consts::PI * self.t_data);
+        let old_center_hz = self.freq_likelihood_center_hz;
+        if !center_hz.is_finite()
+            || !old_center_hz.is_finite()
+            || (center_hz - old_center_hz).abs() <= f64::EPSILON
+            || self.bank_step_hz <= 0.0
+            || self.bank_dhz.is_empty()
+        {
+            return;
+        }
+
+        let center_shift_hz = (center_hz - old_center_hz).abs();
+        let bank_span_hz = self.bank_step_hz * (self.bank_dhz.len().saturating_sub(1) as f64);
+        if center_shift_hz > bank_span_hz {
+            self.freq_likelihood.fill(0.0);
+            self.freq_evidence_symbols = 0;
+            self.snap_cand_hz = None;
+            self.snap_count = 0;
+            self.freq_likelihood_center_hz = center_hz;
+            return;
+        }
+
+        // Preserve evidence by absolute frequency. Linear interpolation is
+        // sufficient because the bank spacing is uniform and the PLL moves
+        // the center by much less than one bank step in normal operation.
+        let old = self.freq_likelihood.clone();
+        let first_dhz = self.bank_dhz[0];
+        for (i, score) in self.freq_likelihood.iter_mut().enumerate() {
+            let target_hz = center_hz + self.bank_dhz[i];
+            let old_pos = (target_hz - old_center_hz - first_dhz) / self.bank_step_hz;
+            if old_pos < 0.0 || old_pos > (old.len().saturating_sub(1) as f64) {
+                *score = 0.0;
+                continue;
+            }
+            let lo = old_pos.floor() as usize;
+            let hi = (lo + 1).min(old.len() - 1);
+            let frac = (old_pos - lo as f64).clamp(0.0, 1.0);
+            *score = old[lo] * (1.0 - frac) + old[hi] * frac;
+        }
+        self.freq_likelihood_center_hz = center_hz;
+    }
+
+    fn accumulate_current_frequency_likelihood(&mut self, metrics: &[f32]) -> (f32, f64) {
+        self.rebase_frequency_likelihood();
+        let (evidence, best_dhz) = Self::accumulate_frequency_likelihood(
+            &mut self.freq_likelihood,
+            &mut self.freq_evidence_symbols,
+            &self.bank_dhz,
+            metrics,
+        );
+        // `best_dhz` is relative to the center used for this symbol. Return
+        // an absolute frequency so a later PLL update cannot shift the snap.
+        (evidence, self.freq_likelihood_center_hz + best_dhz)
     }
 
     fn pll_predict(theta: &mut f64, omega_used: f64, sym_scale: f64) {
@@ -549,7 +677,7 @@ impl<'a> SymbolTracker<'a> {
             self.process_data_symbol(ell, llr_out, q_data)?
         };
 
-        self.apply_freq_snap(outcome.freq_conf, outcome.best_dhz);
+        self.apply_freq_snap(outcome.freq_evidence, outcome.best_freq_hz);
 
         let phase_adj = if let Some(update) = outcome.dll_update {
             self.update_dll(ell, chip_step, update)?
@@ -580,10 +708,9 @@ impl<'a> SymbolTracker<'a> {
         let sf = p.sf();
 
         let mut omega_used = self.omega;
-        let mut best_dhz = 0.0f64;
 
+        let mut freq_metrics = vec![0.0f32; self.bank_domega.len()];
         let mut best_v = f32::NEG_INFINITY;
-        let mut second = f32::NEG_INFINITY;
         for (h, &domega) in self.bank_domega.iter().enumerate() {
             let omega_h = (self.omega + domega).clamp(-self.omega_lim, self.omega_lim);
             Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.theta, omega_h);
@@ -598,18 +725,16 @@ impl<'a> SymbolTracker<'a> {
             }
             let z: Complex32 = self.buffers.u_tmp.iter().copied().sum();
             let m = z.norm_sqr();
+            freq_metrics[h] = m;
             if m > best_v {
-                second = best_v;
                 best_v = m;
                 omega_used = omega_h;
-                best_dhz = self.bank_dhz[h];
                 self.buffers.rot_best.clone_from(&self.buffers.rot_tmp);
                 self.buffers.u_best.clone_from(&self.buffers.u_tmp);
-            } else if m > second {
-                second = m;
             }
         }
-        let freq_conf = (best_v - second) / (best_v.abs() + 1e-18);
+        let (freq_evidence, best_freq_hz) =
+            self.accumulate_current_frequency_likelihood(&freq_metrics);
 
         // Cycle-slip guard.
         let mut z_p: Complex32 = self.buffers.u_best.iter().copied().sum();
@@ -666,8 +791,8 @@ impl<'a> SymbolTracker<'a> {
         }
 
         SymbolProcOutcome {
-            freq_conf,
-            best_dhz,
+            freq_evidence,
+            best_freq_hz,
             dll_update: Some(DllUpdate { dd: false, m: 0 }),
         }
     }
@@ -686,11 +811,10 @@ impl<'a> SymbolTracker<'a> {
         let mw = p.mw();
 
         let mut omega_used = self.omega;
-        let mut best_dhz = 0.0f64;
 
         let mut best_i = 0usize;
+        let mut freq_metrics = vec![0.0f32; self.bank_domega.len()];
         let mut best_v = f32::NEG_INFINITY;
-        let mut second = f32::NEG_INFINITY;
         let mut best_code_conf = 0.0f32;
         for (h, &domega) in self.bank_domega.iter().enumerate() {
             let omega_h = (self.omega + domega).clamp(-self.omega_lim, self.omega_lim);
@@ -706,23 +830,21 @@ impl<'a> SymbolTracker<'a> {
             }
             self.buffers.r_tmp.clone_from(&self.buffers.u_tmp);
             fht1024_in_place(&mut self.buffers.r_tmp)?;
-            let (i_h, conf_h) = Self::best_and_conf_mag(&self.buffers.r_tmp, mw);
+            let (i_h, conf_h) = Self::best_code_and_conf_mag(&self.buffers.r_tmp, mw);
             let m = self.buffers.r_tmp[i_h].norm_sqr();
+            freq_metrics[h] = m;
             if m > best_v {
-                second = best_v;
                 best_v = m;
                 omega_used = omega_h;
-                best_dhz = self.bank_dhz[h];
                 best_i = i_h;
                 best_code_conf = conf_h;
                 self.buffers.rot_best.clone_from(&self.buffers.rot_tmp);
                 self.buffers.r_best.clone_from(&self.buffers.r_tmp);
-            } else if m > second {
-                second = m;
             }
         }
-        let freq_conf = (best_v - second) / (best_v.abs() + 1e-18);
-        // Gate PLL/DD only on code confidence; freq_conf can be flat even when code is OK.
+        let (freq_evidence, best_freq_hz) =
+            self.accumulate_current_frequency_likelihood(&freq_metrics);
+        // Gate PLL/DD only on code confidence; frequency evidence is accumulated separately.
         let data_conf = best_code_conf;
         let q = *q_data;
         if q >= p.n_data() {
@@ -806,36 +928,49 @@ impl<'a> SymbolTracker<'a> {
         *q_data += 1;
 
         Ok(SymbolProcOutcome {
-            freq_conf,
-            best_dhz,
+            freq_evidence,
+            best_freq_hz,
             dll_update,
         })
     }
 
-    fn apply_freq_snap(&mut self, freq_conf: f32, best_dhz: f64) {
-        let snap_conf_min = 0.15f32;
-        if freq_conf.is_finite() && freq_conf >= snap_conf_min {
-            let df = best_dhz;
-            if let Some(cand) = self.snap_cand_hz {
-                if (df - cand).abs() <= 0.5 * self.bank_step_hz {
-                    self.snap_count += 1;
-                } else {
-                    self.snap_cand_hz = Some(df);
-                    self.snap_count = 1;
-                }
+    fn apply_freq_snap(&mut self, freq_evidence: f32, best_freq_hz: f64) {
+        if !(freq_evidence.is_finite()
+            && freq_evidence >= FREQ_SNAP_EVIDENCE_MIN
+            && best_freq_hz.is_finite())
+        {
+            self.snap_cand_hz = None;
+            self.snap_count = 0;
+            return;
+        }
+
+        let candidate_hz = best_freq_hz;
+        if let Some(cand) = self.snap_cand_hz {
+            if (candidate_hz - cand).abs() <= 0.5 * self.bank_step_hz {
+                self.snap_count += 1;
             } else {
-                self.snap_cand_hz = Some(df);
+                self.snap_cand_hz = Some(candidate_hz);
                 self.snap_count = 1;
             }
-            if self.snap_count >= self.freq_snap_confirm {
-                let df2 = self.snap_cand_hz.unwrap_or(0.0);
-                if df2.abs() >= self.freq_snap_min_abs_hz {
-                    self.omega = (self.omega + 2.0 * std::f64::consts::PI * df2 * self.t_data)
-                        .clamp(-self.omega_lim, self.omega_lim);
-                }
-                self.snap_cand_hz = None;
-                self.snap_count = 0;
+        } else {
+            self.snap_cand_hz = Some(candidate_hz);
+            self.snap_count = 1;
+        }
+        if self.snap_count >= self.freq_snap_confirm {
+            let snap_hz = self.snap_cand_hz.unwrap_or(0.0);
+            let center_hz = self.omega / (2.0 * std::f64::consts::PI * self.t_data);
+            let correction_hz = snap_hz - center_hz;
+            if snap_hz.abs() >= self.freq_snap_min_abs_hz {
+                self.omega = (self.omega
+                    + 2.0 * std::f64::consts::PI * correction_hz * self.t_data)
+                    .clamp(-self.omega_lim, self.omega_lim);
             }
+            self.freq_likelihood.fill(0.0);
+            self.freq_likelihood_center_hz =
+                self.omega / (2.0 * std::f64::consts::PI * self.t_data);
+            self.freq_evidence_symbols = 0;
+            self.snap_cand_hz = None;
+            self.snap_count = 0;
         }
     }
 
@@ -914,7 +1049,7 @@ impl ScBltcModem {
         rx_samples: &[Complex32],
         ti_tx: u64,
         frame_start_sample: usize,
-        n_offset_total: &[usize],
+        n_offset_total: &[isize],
         cfo_hz: f64,
         scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
@@ -943,11 +1078,9 @@ impl ScBltcModem {
             derotate_cfo_in_place(&mut x_cfo, p.fs_hz(), cfo_hz);
         }
         let mut x_work = x_cfo.clone();
-        let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as usize;
-
-        // With frequency-hopped waveforms, a ±1 sample error in `n0` can introduce large,
+        // With frequency-hopped waveforms, a ±1 sample error in the reference arrival can introduce large,
         // hop-dependent phase jumps across symbols. Under high noise, acquisition can still
-        // "capture" but return `n0` off by a small number of samples. We therefore try a small
+        // "capture" but return the arrival sample off by a small number of samples. We therefore try a small
         // symmetric refinement window around the provided offsets, returning the first CRC-pass.
         let refine_win: isize = 6;
         let mut deltas: Vec<isize> = Vec::with_capacity(2 * (refine_win as usize) + 1);
@@ -962,32 +1095,30 @@ impl ScBltcModem {
         let mut best_fail: Option<(Option<Vec<u8>>, DecodeMeta)> = None;
         let mut best_score: f32 = f32::NEG_INFINITY;
         for delta in deltas {
-            let mut offs_adj: Vec<usize> = Vec::with_capacity(n_offset_total.len());
-            let mut ok = true;
-            for &o in n_offset_total {
-                let v = (o as isize) + delta;
-                if v < 0 {
-                    ok = false;
-                    break;
-                }
-                offs_adj.push(v as usize);
-            }
-            if !ok {
-                continue;
-            }
+            let candidate_frame_start = if delta >= 0 {
+                frame_start_sample
+                    .checked_add(delta as usize)
+                    .ok_or_else(|| anyhow::anyhow!("frame_start overflow"))?
+            } else {
+                frame_start_sample
+                    .checked_sub(delta.unsigned_abs())
+                    .ok_or_else(|| anyhow::anyhow!("frame_start before buffer"))?
+            };
 
-            let n0 = *offs_adj
-                .first()
+            let min_offset = *n_offset_total
+                .iter()
+                .min()
                 .ok_or_else(|| anyhow::anyhow!("no_offsets"))?;
-            // The first finger is the nominal frame start. Keep it inside the 1 ms epoch
-            // represented by `ti_tx`; delayed multipath fingers may lie beyond this interval.
-            if n0 >= iv_samples {
-                continue;
-            }
-            let start = frame_start_sample
-                .checked_add(n0)
-                .ok_or_else(|| anyhow::anyhow!("frame_start overflow"))?;
-            if start >= x_cfo.len() {
+            let sample_start = if min_offset >= 0 {
+                candidate_frame_start
+                    .checked_add(min_offset as usize)
+                    .ok_or_else(|| anyhow::anyhow!("frame_start overflow"))?
+            } else {
+                candidate_frame_start
+                    .checked_sub(min_offset.unsigned_abs())
+                    .ok_or_else(|| anyhow::anyhow!("frame_start before buffer"))?
+            };
+            if sample_start >= x_cfo.len() || candidate_frame_start >= x_cfo.len() {
                 continue;
             }
 
@@ -1002,7 +1133,9 @@ impl ScBltcModem {
                 },
                 &g.f_seq_hz,
                 &g.j_seq_chips,
-                start,
+                // The sample buffer may start at an earlier finger, but the hop schedule
+                // starts at the candidate reference arrival.
+                candidate_frame_start,
                 -1.0,
             );
 
@@ -1010,8 +1143,8 @@ impl ScBltcModem {
             let (payload, meta) = match self.demod_decode_matched(
                 &y,
                 ti_tx,
-                frame_start_sample,
-                &offs_adj,
+                candidate_frame_start,
+                n_offset_total,
                 scl_list_size,
             ) {
                 Ok(v) => v,
@@ -1054,16 +1187,12 @@ impl ScBltcModem {
         y_matched: &[Complex32],
         ti_tx: u64,
         frame_start_sample: usize,
-        n_offset_total: &[usize],
+        n_offset_total: &[isize],
         scl_list_size: usize,
     ) -> anyhow::Result<(Option<Vec<u8>>, DecodeMeta)> {
         let p = &self.p;
         if n_offset_total.is_empty() {
             return Ok((None, DecodeMeta::error("no_offsets")));
-        }
-        let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as usize;
-        if n_offset_total[0] >= iv_samples {
-            return Ok((None, DecodeMeta::error("frame_start_outside_time_index")));
         }
         let y = y_matched;
 
@@ -1133,5 +1262,76 @@ impl ScBltcModem {
             return Ok((None, meta));
         }
         Ok((Some(payload[..(hdr.length as usize)].to_vec()), meta))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SymbolTracker, FREQ_SNAP_EVIDENCE_MIN};
+
+    #[test]
+    fn frequency_evidence_accumulates_flat_adjacent_candidates() {
+        let bank = [-0.25, 0.0, 0.25];
+        let mut likelihood = [0.0; 3];
+        let mut symbols = 0usize;
+        let metrics = [0.9914f32, 1.0, 0.9914];
+        let mut evidence = 0.0;
+        let mut candidate = 0.0;
+        for _ in 0..64 {
+            (evidence, candidate) = SymbolTracker::accumulate_frequency_likelihood(
+                &mut likelihood,
+                &mut symbols,
+                &bank,
+                &metrics,
+            );
+        }
+        assert_eq!(candidate, 0.0);
+        assert!(
+            evidence >= FREQ_SNAP_EVIDENCE_MIN,
+            "flat single-symbol margin did not accumulate: evidence={evidence}"
+        );
+    }
+
+    #[test]
+    fn frequency_evidence_waits_for_multiple_symbols() {
+        let bank = [-0.25, 0.0, 0.25];
+        let mut likelihood = [0.0; 3];
+        let mut symbols = 0usize;
+        let metrics = [0.4f32, 1.0, 0.4];
+        let (evidence, candidate) = SymbolTracker::accumulate_frequency_likelihood(
+            &mut likelihood,
+            &mut symbols,
+            &bank,
+            &metrics,
+        );
+        assert_eq!(candidate, 0.0);
+        assert_eq!(evidence, 0.0);
+    }
+
+    #[test]
+    fn frequency_evidence_reaches_snap_margin_after_history() {
+        let bank = [-0.25, 0.0, 0.25];
+        let mut likelihood = [0.0; 3];
+        let mut symbols = 0usize;
+        let metrics = [0.9914f32, 1.0, 0.9914];
+        let mut evidence = 0.0;
+        for _ in 0..4 {
+            (evidence, _) = SymbolTracker::accumulate_frequency_likelihood(
+                &mut likelihood,
+                &mut symbols,
+                &bank,
+                &metrics,
+            );
+        }
+        assert!(evidence < FREQ_SNAP_EVIDENCE_MIN);
+        for _ in 0..3 {
+            (evidence, _) = SymbolTracker::accumulate_frequency_likelihood(
+                &mut likelihood,
+                &mut symbols,
+                &bank,
+                &metrics,
+            );
+        }
+        assert!(evidence >= FREQ_SNAP_EVIDENCE_MIN);
     }
 }

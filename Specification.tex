@@ -92,9 +92,10 @@ The following global parameters are predefined:
   \item Acquisition FFT size: $N_{\text{FFT}}=32768$.
   \item CFO search half-bandwidth: $f_{\text{search}}=8000\,\text{Hz}$.
   \item Hybrid verification threshold multiplier: $\gamma_{\text{hyb}}=10$.
-  \item Intra-epoch start-offset stride: $N_{\text{off,stride}}=4$ samples.
+  \item Arrival hypothesis stride: $N_{\text{arrival,stride}}=4$ samples.
   \item Fine-CFO grid: $\Delta f_{\text{fine}}=0.25\,\text{Hz}$ with $q\in\{-8,\dots,8\}$.
   \item Timing-refinement half-window: $T_{\text{rake}}=4\,\text{ms}$ (equivalently $N_{\text{rake}}=\lfloor F_s T_{\text{rake}}\rfloor$ samples).
+  \item RAKE relative-energy threshold: $\eta_{\text{rake}}=0.25$ of the strongest selected arrival.
   \item Pilot timing verification window: $N_{\text{pilot,win}}=32$ samples.
   \item Requested RAKE-finger output count: $N_{\text{finger,req}}$ with
     \[
@@ -104,13 +105,15 @@ The following global parameters are predefined:
 \item \textbf{Receiver Tracking Parameters}:
   \begin{itemize}
   \item Numerical regularization: $\epsilon=10^{-18}$.
-  \item Post-acquisition frame-start refinement window: $N_{\Delta n}=6$ samples (i.e.\ $\Delta n\in[-6,6]$).
+  \item Post-acquisition arrival-sample refinement window: $N_{\Delta n}=6$ samples (i.e.\ $\Delta n\in[-6,6]$).
   \item Maximum number of tracking/combining fingers: $N_{\text{finger,max}}=3$.
   \item Carrier-tracking frequency bank: $\Delta f_h \in \{-4.0,-3.75,\dots,+4.0\}\,\text{Hz}$ with step $0.25\,\text{Hz}$.
   \item Carrier-tracking frequency limit: $f_{\text{PLL,max}}=200\,\text{Hz}$.
-  \item Frequency-snap rule constants: $\mathrm{conf}_{\text{freq,min}}=0.15$, $f_{\text{snap,tol}}=0.125\,\text{Hz}$, $N_{\text{snap}}=3$, $f_{\text{snap,min}}=0.75\,\text{Hz}$.
+  \item Frequency-bank likelihood memory: exponential decay $\lambda_{\text{freq}}=0.95$, minimum evidence history $N_{\text{freq,min}}=4$ symbols, and cumulative snap margin $\Gamma_{\text{freq}}=0.05$.
+  \item Frequency-snap confirmation: $f_{\text{snap,tol}}=0.125\,\text{Hz}$, $N_{\text{snap}}=3$, and $f_{\text{snap,min}}=0.75\,\text{Hz}$.
   \item Pilot cycle-slip magnitude threshold factor: $\eta_{\text{cs}}=0.25$ (threshold $|z_\ell|>\eta_{\text{cs}}M_{\text{pre}}$ on pilots).
   \item Pilot-aided channel-gain smoothing factor: $\alpha_A=\frac{1}{16}$.
+  \item Arrival-delay search half-window: $T_{\text{arrival,search}}=4\,\text{ms}$.
   \item DLL early/late spacing: $0.5$ chips. DLL step limit: $\pm 2000\,\mathrm{ppm}$ around the nominal sample step.
   \end{itemize}
 \end{itemize}
@@ -455,7 +458,7 @@ All receiver processing is defined on subsequences of $x[n]$. Buffering and RF f
 
 Blind acquisition maps $x[n]$ and $\mathcal{T}$ to an estimate of the frame parameters
 \[
-  \left(\widehat{\mathit{TI}}_{\text{tx}},\ \hat n_{\text{coarse}},\ \widehat{\Delta f},\ \{\hat n_{\text{finger},i}\}_{i=0}^{N_{\text{finger,sel}}-1}\right),
+  \left(\widehat{\mathit{TI}}_{\text{tx}},\ \hat a_{\text{coarse}},\ \widehat{\Delta f},\ \{\Delta\hat a_i\}_{i=0}^{N_{\text{finger,sel}}-1}\right),
 \]
 where $N_{\text{finger,sel}}\le N_{\text{finger,out}}$.
 
@@ -470,42 +473,44 @@ window as
 \[
   b(\mathit{TI})=(\mathit{TI}-\mathit{TI}_{\min})\,N_{\text{IV,samp}}.
 \]
-Define the coarse frame-start hypothesis set (samples)
+For each TimeIndex, define the receiver-sample arrival hypothesis set. Let
+$N_{\text{arrival}}=\mathrm{round}(F_s T_{\text{arrival,search}})$.
 \[
-  \mathcal{N}_{\text{coarse}}=\{0, N_{\text{off,stride}}, 2N_{\text{off,stride}}, \dots\}\cap [0, N_{\text{IV,samp}}).
+  \begin{aligned}
+  \mathcal{A}(\mathit{TI})=\{a:\;&\max(0,b(\mathit{TI})-N_{\text{arrival}})\le a\\
+  &\le b(\mathit{TI})+N_{\text{IV,samp}}+N_{\text{arrival}},\quad
+  \text{required samples available}\}.
+  \end{aligned}
 \]
-For a hypothesis $(\mathit{TI},n_0)$, the nominal frame start is
-$b(\mathit{TI})+n_0$.  The receiver shall test a hypothesis only when
-$n_0\in[0,N_{\text{IV,samp}})$; therefore the nominal signal start is always inside the
-one-millisecond interval represented by the tested $\mathit{TI}$.  A start in a neighboring
-interval shall be tested with that neighboring TimeIndex and its own generated code.
+For a hypothesis $(\mathit{TI},a)$, $\mathit{TI}$ selects the code schedule and $a$ selects the
+receiver sample of the reference arrival path.
 
 \subsubsection{Step B.2: Coarse Preamble Metric and Coarse CFO Estimate}
 
-For a hypothesis pair $(\mathit{TI},n_0)\in\mathcal{T}\times\mathcal{N}_{\text{coarse}}$, define the locally generated schedules
+For a hypothesis pair $(\mathit{TI},a)$ with $a\in\mathcal{A}(\mathit{TI})$, define the locally generated schedules
 \[
   (C_{\text{seq}}, F_{\text{seq}}, J_{\text{seq}})=\texttt{GenCode}(K_{\text{sec}}, \mathit{TI}, N_{\text{sym}}),
 \]
-and the symbol start offsets (relative to the frame start, in samples)
+and the symbol start offsets (relative to the reference arrival, in samples)
 \[
   n_\ell = \left(\sum_{k=0}^{\ell-1} (\mathit{SF}+j_k)\right)\cdot \mathit{OSF},\quad \ell=0,\dots,N_{\text{sym}}-1.
 \]
 
 Let $s_0[n]$ and $s_1[n]$ be the locally generated TX-shaped, hopped preamble reference waveforms for preamble symbols $\ell=0,1$ (Barker-2 sign pattern $+W_0,-W_0$), each restricted to its $1024$-chip data segment. Let $\Delta n_1=(\mathit{SF}+j_0)\cdot \mathit{OSF}$ be the sample separation between the two preamble symbol starts. Phase continuity across the preamble boundary is defined by including the accumulated hop phase at the start of $s_1[n]$.
 
-Define the preamble observation window $x_{n_0}[n]=x[n_0+n]$ and the sparse matched window
+Define the preamble observation window $x_a[n]=x[a+n]$ and the sparse matched window
 \[
-  y_{\mathit{TI},n_0}[n]=
+  y_{\mathit{TI},a}[n]=
   \begin{cases}
-  x_{n_0}[n]\cdot s_0^*[n] & n\in[0, \mathit{SF}\cdot\mathit{OSF}) \\
+  x_a[n]\cdot s_0^*[n] & n\in[0, \mathit{SF}\cdot\mathit{OSF}) \\
   0 & n\in[\mathit{SF}\cdot\mathit{OSF}, (\mathit{SF}+j_0)\cdot\mathit{OSF}) \\
-  x_{n_0}[n]\cdot s_1^*[n-\Delta n_1] & n\in[\Delta n_1, \Delta n_1+\mathit{SF}\cdot\mathit{OSF})
+  x_a[n]\cdot s_1^*[n-\Delta n_1] & n\in[\Delta n_1, \Delta n_1+\mathit{SF}\cdot\mathit{OSF})
   \end{cases}.
 \]
 
-Let $\widetilde y_{\mathit{TI},n_0}[n]$ be the length-$N_{\text{FFT}}$ zero-padded sequence defined by $\widetilde y_{\mathit{TI},n_0}[n]=y_{\mathit{TI},n_0}[n]$ for valid $n$ in the window above and $\widetilde y_{\mathit{TI},n_0}[n]=0$ otherwise. Define
+Let $\widetilde y_{\mathit{TI},a}[n]$ be the length-$N_{\text{FFT}}$ zero-padded sequence defined by $\widetilde y_{\mathit{TI},a}[n]=y_{\mathit{TI},a}[n]$ for valid $n$ in the window above and $\widetilde y_{\mathit{TI},a}[n]=0$ otherwise. Define
 \[
-  Y_{\mathit{TI},n_0}[k]=\mathrm{FFT}_{N_{\text{FFT}}}\{\widetilde y_{\mathit{TI},n_0}[n]\}[k].
+  Y_{\mathit{TI},a}[k]=\mathrm{FFT}_{N_{\text{FFT}}}\{\widetilde y_{\mathit{TI},a}[n]\}[k].
 \]
 
 Define the bin limit
@@ -514,27 +519,27 @@ Define the bin limit
 \]
 and the selected coarse bin
 \[
-  k_0=\arg\max_{k\in\{0,1,\dots,k_{\max}\}\cup\{N_{\text{FFT}}-k_{\max},\dots,N_{\text{FFT}}-1\}} |Y_{\mathit{TI},n_0}[k]|^2.
+  k_0=\arg\max_{k\in\{0,1,\dots,k_{\max}\}\cup\{N_{\text{FFT}}-k_{\max},\dots,N_{\text{FFT}}-1\}} |Y_{\mathit{TI},a}[k]|^2.
 \]
 Let $b_0\in[-k_{\max},k_{\max}]$ be the signed bin index corresponding to $k_0$. For $|b_0|<k_{\max}$, define the quadratic interpolation
 \[
   \delta = \frac{1}{2}\frac{P_{-1}-P_{+1}}{P_{-1}-2P_0+P_{+1}},\quad b=b_0+\delta,
 \]
-with $P_{-1}=|Y_{\mathit{TI},n_0}[b_0-1]|^2$, $P_0=|Y_{\mathit{TI},n_0}[b_0]|^2$, $P_{+1}=|Y_{\mathit{TI},n_0}[b_0+1]|^2$ (circular indexing). The coarse CFO estimate is
+with $P_{-1}=|Y_{\mathit{TI},a}[b_0-1]|^2$, $P_0=|Y_{\mathit{TI},a}[b_0]|^2$, $P_{+1}=|Y_{\mathit{TI},a}[b_0+1]|^2$ (circular indexing). The coarse CFO estimate is
 \[
-  \widehat{\Delta f}_{\text{coarse}}(\mathit{TI},n_0)=b\cdot \frac{F_s}{N_{\text{FFT}}}.
+  \widehat{\Delta f}_{\text{coarse}}(\mathit{TI},a)=b\cdot \frac{F_s}{N_{\text{FFT}}}.
 \]
 
 Define the fine CFO grid
 \[
-  \mathcal{F}_{\text{fine}}(\mathit{TI},n_0)=\left\{\widehat{\Delta f}_{\text{coarse}}(\mathit{TI},n_0)+q\Delta f_{\text{fine}}:\ q\in\{-8,\dots,8\}\right\}.
+  \mathcal{F}_{\text{fine}}(\mathit{TI},a)=\left\{\widehat{\Delta f}_{\text{coarse}}(\mathit{TI},a)+q\Delta f_{\text{fine}}:\ q\in\{-8,\dots,8\}\right\}.
 \]
-The refined CFO estimate $\widehat{\Delta f}(\mathit{TI},n_0)$ and the refined preamble energy $V_{\text{pre}}(\mathit{TI},n_0)$ are defined by
+The refined CFO estimate $\widehat{\Delta f}(\mathit{TI},a)$ and the refined preamble energy $V_{\text{pre}}(\mathit{TI},a)$ are defined by
 \[
-  \widehat{\Delta f}(\mathit{TI},n_0)=\arg\max_{\Delta f\in\mathcal{F}_{\text{fine}}(\mathit{TI},n_0)}\left|\sum_n y_{\mathit{TI},n_0}[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2,
+  \widehat{\Delta f}(\mathit{TI},a)=\arg\max_{\Delta f\in\mathcal{F}_{\text{fine}}(\mathit{TI},a)}\left|\sum_n y_{\mathit{TI},a}[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2,
 \]
 \[
-  V_{\text{pre}}(\mathit{TI},n_0)=\max_{\Delta f\in\mathcal{F}_{\text{fine}}(\mathit{TI},n_0)}\left|\sum_n y_{\mathit{TI},n_0}[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2.
+  V_{\text{pre}}(\mathit{TI},a)=\max_{\Delta f\in\mathcal{F}_{\text{fine}}(\mathit{TI},a)}\left|\sum_n y_{\mathit{TI},a}[n]\cdot e^{-j2\pi\Delta f\,n/F_s}\right|^2.
 \]
 
 \subsubsection{Step B.3: Pilot Verification and Candidate Selection}
@@ -546,11 +551,11 @@ Define a noise power estimate from the raw baseband samples
 
 Pilot symbol indices are defined by $\ell_{\text{pilot}}(r)=2+5r$, $r=0,\dots,N_{\text{pilot}}-1$. For each pilot $r$, let $p_r[n]$ be the locally generated TX-shaped, hopped pilot reference waveform for the pilot's $1024$-chip data segment. Define the pilot verification energy
 \[
-  E_r(\mathit{TI},n_0)=\max_{\Delta n\in[-N_{\text{pilot,win}},N_{\text{pilot,win}}]}\left|\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x\!\left[n_0+n_{\ell_{\text{pilot}}(r)}+\Delta n+n\right]\cdot p_r^*[n]\cdot e^{-j2\pi\widehat{\Delta f}(\mathit{TI},n_0)\,n/F_s}\right|^2,
+  E_r(\mathit{TI},a)=\max_{\Delta n\in[-N_{\text{pilot,win}},N_{\text{pilot,win}}]}\left|\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x\!\left[a+n_{\ell_{\text{pilot}}(r)}+\Delta n+n\right]\cdot p_r^*[n]\cdot e^{-j2\pi\widehat{\Delta f}(\mathit{TI},a)\,n/F_s}\right|^2,
 \]
 and
 \[
-  V_{\text{pilot}}(\mathit{TI},n_0)=\sum_{r=0}^{N_{\text{pilot}}-1}E_r(\mathit{TI},n_0).
+  V_{\text{pilot}}(\mathit{TI},a)=\sum_{r=0}^{N_{\text{pilot}}-1}E_r(\mathit{TI},a).
 \]
 
 Define the hybrid acceptance threshold
@@ -565,91 +570,84 @@ The reference energies are defined by
 \]
 Define the accepted set
 \[
-  \mathcal{H}_{\text{acc}}=\left\{(\mathit{TI},n_0)\in\mathcal{T}\times\mathcal{N}_{\text{coarse}}:\ V_{\text{pre}}(\mathit{TI},n_0)+V_{\text{pilot}}(\mathit{TI},n_0)>\Gamma\right\}.
+  \mathcal{H}_{\text{acc}}=\left\{(\mathit{TI},a): a\in\mathcal{A}(\mathit{TI}),\ V_{\text{pre}}(\mathit{TI},a)+V_{\text{pilot}}(\mathit{TI},a)>\Gamma\right\}.
 \]
 If $\mathcal{H}_{\text{acc}}=\emptyset$, acquisition fails. Otherwise,
 \[
-  (\widehat{\mathit{TI}}_{\text{tx}},\hat n_{\text{coarse}})=\arg\max_{(\mathit{TI},n_0)\in\mathcal{H}_{\text{acc}}}\left(V_{\text{pre}}(\mathit{TI},n_0)+V_{\text{pilot}}(\mathit{TI},n_0)\right),
+  (\widehat{\mathit{TI}}_{\text{tx}},\hat a_{\text{coarse}})=\arg\max_{(\mathit{TI},a)\in\mathcal{H}_{\text{acc}}}\left(V_{\text{pre}}(\mathit{TI},a)+V_{\text{pilot}}(\mathit{TI},a)\right),
 \]
-with tie-break by smaller $(\mathit{TI},n_0)$.
+with tie-break by smaller $(\mathit{TI},a)$.
 
 \subsubsection{Step B.4: Timing Refinement and RAKE Finger Set}
 
-Define the timing-refinement window for the nominal frame start (samples)
+Define the RAKE timing window for the receiver arrival sample (samples)
 \[
-  \mathcal{W}=\left\{\hat n:\max(0,\hat n_{\text{coarse}}-N_{\text{rake}})\le \hat n
-  \le \min(N_{\text{IV,samp}}-1,\hat n_{\text{coarse}}+N_{\text{rake}})\right\}.
+  \mathcal{W}_{\text{rake}}=\left\{\hat a:\max(0,\hat a_{\text{coarse}}-N_{\text{rake}})\le \hat a
+  \le \hat a_{\text{coarse}}+N_{\text{rake}}\right\}.
 \]
-The refined nominal frame start shall remain in this interval.  A
-later RAKE finger can be outside this interval when it represents a delayed multipath path; it
-does not change the TimeIndex or the nominal frame start.
-For RAKE search, define the valid timing window
+Remove positions for which the required preamble samples are not available. For each
+$\hat a\in\mathcal{W}_{\text{rake}}$, define the two coherent preamble correlations
 \[
-  \mathcal{W}_{\text{rake}}=\left\{\hat n:\max(0,\hat n_{\text{coarse}}-N_{\text{rake}})\le \hat n
-  \le \hat n_{\text{coarse}}+N_{\text{rake}}\right\},
-\]
-after removing positions for which the required preamble samples are not available.  For each
-$\hat n\in\mathcal{W}_{\text{rake}}$, define the two coherent preamble correlations
-\[
-  z_0(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+n]\cdot s_0^*[n],
+  z_0(\hat a)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat a+n]\cdot s_0^*[n],
 \]
 \[
-  z_1(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+\Delta n_1+n]\cdot s_1^*[n],
+  z_1(\hat a)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat a+\Delta n_1+n]\cdot s_1^*[n],
 \]
 and the noncoherent timing score
 \[
-  \Lambda(\hat n)=|z_0(\hat n)|^2+|z_1(\hat n)|^2.
+  \Lambda(\hat a)=|z_0(\hat a)|^2+|z_1(\hat a)|^2.
 \]
-The refined main-path start is
+The refined reference arrival sample is
 \[
-  \hat n_0=\arg\max_{\hat n\in\mathcal{W}}\Lambda(\hat n),
+  \hat a_0=\arg\max_{\hat a\in\mathcal{W}_{\text{rake}}}\Lambda(\hat a),
 \]
-with tie-break by smaller $\hat n$.
+with tie-break by smaller $\hat a$.
 
-Define the local-maximum set over the valid RAKE window
+Select the strongest valid arrival as the reference path. Select additional arrivals from this
+window only when their correlation energy passes the relative-energy threshold and
+their separation from every selected arrival is at least $\mathit{OSF}$. Define each RAKE delay
+relative to the selected reference path as
 \[
-  \mathcal{M}=\left\{\hat n\in\mathcal{W}_{\text{rake}}:\ \Lambda(\hat n)\ge \Lambda(\hat n-1)\ \wedge\ \Lambda(\hat n)>\Lambda(\hat n+1)\right\},
+  \Delta \hat a_i=\hat a_i-\hat a_0.
 \]
-with boundary cases interpreted by restricting to valid indices in $\mathcal{W}_{\text{rake}}$. Define $\mathcal{M}_+=\{\hat n\in\mathcal{M}:\hat n\ge \hat n_0\}$.
-The constraint $\hat n_0\in\mathcal{W}$ applies to the nominal frame start only.  A selected
-finger in $\mathcal{M}_+$ may be later than $N_{\text{IV,samp}}-1$ when it represents a delayed
-multipath path; such a finger does not change the TimeIndex interval of $\hat n_0$.
+The RAKE delays are signed differences in receiver-sample coordinates.
 
 Define the (unordered) RAKE finger set as any maximizer of
 \[
-  \mathcal{F}^\star\in\arg\max_{\substack{\mathcal{F}\subseteq\mathcal{M}_+\\ |\mathcal{F}|\le N_{\text{finger,out}}\\ \hat n_0\in\mathcal{F}\\ \forall \hat n_i\neq \hat n_j\in\mathcal{F}:\ |\hat n_i-\hat n_j|\ge \mathit{OSF}}}\ \sum_{\hat n\in\mathcal{F}}\Lambda(\hat n),
+  \mathcal{F}^\star\in\arg\max_{\substack{\mathcal{F}\subseteq\mathcal{W}_{\text{rake}}\\ |\mathcal{F}|\le N_{\text{finger,out}}\\ \hat a_0\in\mathcal{F}\\ \forall \hat a_i\neq \hat a_j\in\mathcal{F}:\ |\hat a_i-\hat a_j|\ge \mathit{OSF}}}\ \sum_{\hat a\in\mathcal{F}}\Lambda(\hat a),
 \]
-with tie-break by choosing the lexicographically smallest sequence obtained by ordering $\mathcal{F}$ by descending $\Lambda(\hat n)$ and then ascending $\hat n$.
+with tie-break by choosing the lexicographically smallest sequence obtained by ordering $\mathcal{F}$ by descending $\Lambda(\hat a)$ and then ascending $\hat a$.
 
-Let $N_{\text{finger,sel}}=|\mathcal{F}^\star|$. The ordered RAKE finger list $\{\hat n_{\text{finger},i}\}_{i=0}^{N_{\text{finger,sel}}-1}$ is defined as the elements of $\mathcal{F}^\star$ ordered by descending $\Lambda(\hat n)$ (tie-break: smaller $\hat n$).
+Let $N_{\text{finger,sel}}=|\mathcal{F}^\star|$. The ordered RAKE finger arrivals
+$\{\hat a_i\}_{i=0}^{N_{\text{finger,sel}}-1}$ are the elements of $\mathcal{F}^\star$ ordered by
+descending $\Lambda(\hat a)$ (tie-break: smaller $\hat a$). The decoder receives the reference
+arrival $\hat a_0$ and the relative delays $\Delta\hat a_i=\hat a_i-\hat a_0$.
 
 The acquisition verification statistic is
 \[
-  V_{\text{acq}}=V_{\text{pre}}(\widehat{\mathit{TI}}_{\text{tx}},\hat n_{\text{coarse}})+V_{\text{pilot}}(\widehat{\mathit{TI}}_{\text{tx}},\hat n_{\text{coarse}}).
+  V_{\text{acq}}=V_{\text{pre}}(\widehat{\mathit{TI}}_{\text{tx}},\hat a_{\text{coarse}})+V_{\text{pilot}}(\widehat{\mathit{TI}}_{\text{tx}},\hat a_{\text{coarse}}).
 \]
 
 \subsection{Step C: Matched Filtering, RAKE, and Tracking}
 
 This step defines the matched-filtered, de-hopped sequence and the carrier/code tracking state variables that parameterize demodulation.
 
-\subsubsection{Step C.1: Frame-Start Refinement}
+\subsubsection{Step C.1: Arrival-Path Refinement}
 
 Define the candidate shift set $\Delta\mathcal{N}=\{-N_{\Delta n},\dots,+N_{\Delta n}\}$ and the preference rank function
 \[
   \rho(0)=0,\quad \rho(-d)=2d-1,\quad \rho(+d)=2d,\quad d=1,\dots,N_{\Delta n}.
 \]
-Define the valid frame-start shifts
-\[
-  \Delta\mathcal{N}_{\text{epoch}}=\left\{\Delta n\in\Delta\mathcal{N}:0\le \hat n_0+\Delta n<N_{\text{IV,samp}}\right\}.
-\]
-Only shifts in $\Delta\mathcal{N}_{\text{epoch}}$ shall be decoded for this TimeIndex.  For each
-$\Delta n\in\Delta\mathcal{N}_{\text{epoch}}$, define the candidate frame start
-$\hat n_{\text{frm}}(\Delta n)=\hat n_0+\Delta n$ and shifted finger starts
-$\hat n_{\text{finger},i}(\Delta n)=\hat n_{\text{finger},i}+\Delta n$.
+For each $\Delta n\in\Delta\mathcal{N}$, define the candidate reference arrival
+$\hat a_{\text{ref}}(\Delta n)=\hat a_0+\Delta n$ and shift every selected finger arrival by
+the same amount. A candidate is valid when the required samples are available in the receiver
+buffer.
 
-Let $\hat U(\Delta n)$ be the decoded information bits produced by applying Steps~C--D with frame start $\hat n_{\text{frm}}(\Delta n)$ and finger starts $\{\hat n_{\text{finger},i}(\Delta n)\}$. Let $\mathrm{CRC}(\hat U(\Delta n))\in\{0,1\}$ be the CRC-32C verification result.
+Let $\hat U(\Delta n)$ be the decoded information bits produced by applying Steps~C--D with
+reference arrival $\hat a_{\text{ref}}(\Delta n)$ and relative finger delays
+$\{\Delta\hat a_i\}$. Let $\mathrm{CRC}(\hat U(\Delta n))\in\{0,1\}$ be the CRC-32C verification result.
 
-Define the CRC-valid set $\Delta\mathcal{N}_{\text{crc}}=\{\Delta n\in\Delta\mathcal{N}_{\text{epoch}}:\mathrm{CRC}(\hat U(\Delta n))=1\}$. If $\Delta\mathcal{N}_{\text{crc}}\neq\emptyset$, then
+Define the CRC-valid set $\Delta\mathcal{N}_{\text{crc}}=\{\Delta n\in\Delta\mathcal{N}:\mathrm{CRC}(\hat U(\Delta n))=1\}$. If $\Delta\mathcal{N}_{\text{crc}}\neq\emptyset$, then
 \[
   \Delta n^\star=\arg\min_{\Delta n\in\Delta\mathcal{N}_{\text{crc}}}\rho(\Delta n).
 \]
@@ -666,14 +664,13 @@ with
 \]
 where $\mathbf{u}_{i,\ell}[j]$ is defined in Step~C.4 and $z_\ell$ is defined in Step~C.5. The selected shift is
 \[
-  \Delta n^\star=\arg\max_{\Delta n\in\Delta\mathcal{N}_{\text{epoch}}} V(\Delta n),
+  \Delta n^\star=\arg\max_{\Delta n\in\Delta\mathcal{N}} V(\Delta n),
 \]
 with tie-break by smaller $\rho(\Delta n)$.
 
-The refined frame start and finger starts are
-\[
-  \hat n_{\text{frm}}=\hat n_{\text{frm}}(\Delta n^\star),\quad \hat n_{\text{finger},i}^{\star}=\hat n_{\text{finger},i}(\Delta n^\star).
-\]
+The refined reference arrival is $\hat a_{\text{ref}}(\Delta n^\star)$. The decoder uses this
+sample and the relative finger delays for matched filtering and tracking.
+Set $\hat a_{\text{ref}}=\hat a_{\text{ref}}(\Delta n^\star)$ for the remaining receiver steps.
 
 \subsubsection{Step C.2: CFO Derotation, De-hopping, and Matched Filtering}
 
@@ -691,7 +688,7 @@ Define the symbol start offsets (samples)
   n_\ell = \left(\sum_{k=0}^{\ell-1} (\mathit{SF}+j_k)\right)\cdot \mathit{OSF},\quad \ell=0,\dots,N_{\text{sym}}-1.
 \]
 
-Define the phase-continuous de-hopping phasor on the frame-relative sample index $m=n-\hat n_{\text{frm}}$. Let $\ell(m)$ be the unique symbol index whose time span (data+guard) contains $m$; for $m<0$, define $\ell(m)=0$. Define
+Define the phase-continuous de-hopping phasor on the frame-relative sample index $m=n-\hat a_{\text{ref}}$. Let $\ell(m)$ be the unique symbol index whose time span (data+guard) contains $m$; for $m<0$, define $\ell(m)=0$. Define
 \[
   \Phi[-1]=0.
 \]
@@ -700,7 +697,7 @@ Define the phase-continuous de-hopping phasor on the frame-relative sample index
 \]
 The de-hopped sequence is
 \[
-  x_{\text{dh}}[n]=x_{\text{cfo}}[n]\cdot D[n-\hat n_{\text{frm}}].
+  x_{\text{dh}}[n]=x_{\text{cfo}}[n]\cdot D[n-\hat a_{\text{ref}}].
 \]
 
 Define the matched-filter output (receive RRC, same taps as the transmitter)
@@ -715,10 +712,13 @@ Let $N_{\text{finger,sel}}$ be the number of acquired finger positions and defin
 \[
   N_{\text{finger}}=\min(N_{\text{finger,max}}, N_{\text{finger,sel}}).
 \]
-Define the per-finger integer delay (samples) relative to the main finger:
+Define the per-finger signed delay (samples) relative to the receiver-selected reference path:
 \[
-  \Delta d_i = \hat n_{\text{finger},i}^{\star} - \hat n_{\text{finger},0}^{\star},\quad i=0,\dots,N_{\text{finger}}-1.
+  \Delta d_i = \Delta\hat a_i = \hat a_i-\hat a_0,
+  \quad i=0,\dots,N_{\text{finger}}-1.
 \]
+The first finger is the reference and has $\Delta d_0=0$. Other fingers may have positive or
+negative delays.
 
 Define the pilot symbol index set
 \[
@@ -733,7 +733,7 @@ Define the common timing correction state $\tau_\ell$ (samples) with initializat
 
 Define the tracked symbol start time for finger $i$ and symbol $\ell$ (samples)
 \[
-  t_{i,\ell}=\hat n_{\text{finger},i}^{\star}+D_{\text{cas}}+n_\ell+\tau_\ell.
+  t_{i,\ell}=\hat a_0+\Delta d_i+D_{\text{cas}}+n_\ell+\tau_\ell.
 \]
 Define the tracked samples-per-chip $\Delta_{\text{chip}}=\mathit{step}_\ell/\mathit{SF}$. For each chip index $j=0,\dots,\mathit{SF}-1$, define the fractional sample index
 \[
@@ -805,11 +805,32 @@ and
   (h_{\text{best}},\hat m_\ell)=\arg\max_{h,m\in[0,255]} |R_{\ell,h}[m]|^2.
 \]
 
-Let $P_{(1)}\ge P_{(2)}$ be the largest and second-largest values of $|R_{\ell,h_{\text{best}}}[m]|^2$ over $m\in[0,255]$, and let $Q_{(1)}\ge Q_{(2)}$ be the largest and second-largest values of the selected hypothesis score (pilot: $|z_{\ell,h}|^2$; data: $\max_m |R_{\ell,h}[m]|^2$). Define
+Let $P_{(1)}\ge P_{(2)}$ be the largest and second-largest values of $|R_{\ell,h_{\text{best}}}[m]|^2$ over $m\in[0,255]$. Define
 \[
-  \mathrm{conf}_{\text{code}}=\frac{P_{(1)}-P_{(2)}}{P_{(1)}+\epsilon},\quad
-  \mathrm{conf}_{\text{freq}}=\frac{Q_{(1)}-Q_{(2)}}{Q_{(1)}+\epsilon}.
+  \mathrm{conf}_{\text{code}}=\frac{P_{(1)}-P_{(2)}}{P_{(1)}+\epsilon}.
 \]
+
+For each symbol and each frequency-bank hypothesis $h$, define the frequency metric
+\[
+  M_{\ell,h}=\begin{cases}
+    |z_{\ell,h}|^2 & \ell\in\{0,1\}\cup\mathcal{P},\\
+    \max_m |R_{\ell,h}[m]|^2 & \text{otherwise}.
+  \end{cases}
+\]
+Normalize the metrics within the current symbol and accumulate them across symbols:
+\[
+  \overline M_{\ell,h}=\frac{M_{\ell,h}}{\max_k M_{\ell,k}+\epsilon},\qquad
+  L_{\ell,h}=\lambda_{\text{freq}}L_{\ell-1,h}+\overline M_{\ell,h},
+  \quad L_{-1,h}=0.
+\]
+Let $L_{\ell,(1)}\ge L_{\ell,(2)}$ be the largest and second-largest accumulated likelihoods. Define the frequency evidence
+\[
+  E_{\text{freq},\ell}=\begin{cases}
+    L_{\ell,(1)}-L_{\ell,(2)} & \text{if at least }N_{\text{freq,min}}\text{ valid symbols have been accumulated},\\
+    0 & \text{otherwise}.
+  \end{cases}
+\]
+The frequency evidence uses the accumulated likelihood margin across symbols.
 
 Define the symbol span factor
 \[
@@ -864,12 +885,17 @@ The cycle-slip corrected carrier phase and polarity state are defined by
   p_{\ell+1}=(-1)^{\chi_\ell}p_\ell.
 \]
 
-Define the frequency-snap state $(\nu_\ell,c_\ell)$ with initialization $(\nu_0,c_0)=(0,0)$, where $\nu_\ell$ is the held bank offset (Hz) and $c_\ell\in\{0,\dots,N_{\text{snap}}\}$ is a consecutive-count state. Let $\Delta f_{\ell}=\Delta f_{h_{\text{best}}}$. The state update is
+Define the frequency-snap state $(\nu_\ell,c_\ell)$ with initialization $(\nu_0,c_0)=(0,0)$, where $\nu_\ell$ is the held bank offset (Hz) and $c_\ell\in\{0,\dots,N_{\text{snap}}\}$ is a consecutive-count state. Let
+\[
+  h^*_{\ell}=\arg\max_h L_{\ell,h},\qquad \Delta f_{\ell}=\Delta f_{h^*_{\ell}}.
+\]
+The state update is
 \[
   (\nu'_{\ell+1},c'_{\ell+1})=
   \begin{cases}
-  (\nu_\ell,\min(c_\ell+1,N_{\text{snap}})) & \mathrm{conf}_{\text{freq}}\ge \mathrm{conf}_{\text{freq,min}}\ \wedge\ \Delta f_{\ell}\neq 0\ \wedge\ |\Delta f_{\ell}-\nu_\ell|\le f_{\text{snap,tol}}\\
-  (\Delta f_{\ell},0) & \text{otherwise}.
+  (\nu_\ell,\min(c_\ell+1,N_{\text{snap}})) & E_{\text{freq},\ell}\ge\Gamma_{\text{freq}}\ \wedge\ |\Delta f_{\ell}-\nu_\ell|\le f_{\text{snap,tol}}\\
+  (\Delta f_{\ell},1) & E_{\text{freq},\ell}\ge\Gamma_{\text{freq}}\ \wedge\ |\Delta f_{\ell}-\nu_\ell|>f_{\text{snap,tol}}\\
+  (0,0) & E_{\text{freq},\ell}<\Gamma_{\text{freq}}.
   \end{cases}
 \]
 Define the snap event indicator
@@ -887,6 +913,7 @@ The post-snap frequency state and stored snap state are defined by
   (\nu'_{\ell+1},c'_{\ell+1}) & \psi_{\ell+1}=0
   \end{cases}.
 \]
+After a snap event, set every accumulated frequency likelihood $L_{\ell,h}$ to zero before processing the next symbol.
 
 Given loop bandwidth $B_L$ (Hz) and damping $\zeta$, define
 \[

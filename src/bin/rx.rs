@@ -23,6 +23,9 @@ const MAGIC: &[u8; 8] = b"SCBLTC01";
 
 /// Number of RAKE fingers to initialize from acquisition.
 const ACQ_N_FINGER: usize = 3;
+// Keep each acquisition pass short enough to return to the sample reader. The complete
+// arrival-search interval is still scanned for every TI, so this only changes scheduling.
+const ACQ_MAX_BATCH_TIS: u64 = 8;
 
 #[derive(Parser, Debug)]
 #[command(about = "SC-BLTC receiver over TCP")]
@@ -87,8 +90,8 @@ fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
 #[derive(Clone, Debug)]
 struct Pending {
     ti: u64,
-    base_abs: u64,
-    offsets: Vec<usize>,
+    arrival_abs: u64,
+    offsets: Vec<isize>,
     cfo_hz: f64,
     p_max: f32,
     need_abs: u64,
@@ -148,7 +151,11 @@ impl Receiver {
             .round()
             .max(0.0) as u64;
         let frame_max = p.frame_max_samples_with_jitter() as u64;
-        let acq_guard_samples = rake_search_half_samples + frame_max + 64;
+        let arrival_search_half_samples = ((p.fs_hz() as f64) * p.arrival_search_half_s())
+            .round()
+            .max(0.0) as u64;
+        let acq_guard_samples =
+            arrival_search_half_samples + rake_search_half_samples + frame_max + 64;
         let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
 
         let cap_samples = (args.buffer_sec.max(1.0) * fs).round() as usize;
@@ -248,7 +255,7 @@ impl Receiver {
         raw.clear();
         raw.reserve(n_samp);
         let bytes = &self.signal.stash[self.signal.stash_off..self.signal.stash_off + used];
-        for chunk in bytes.chunks_exact(8) {
+        for chunk in bytes.chunks(8) {
             let mut re_b = [0u8; 4];
             let mut im_b = [0u8; 4];
             re_b.copy_from_slice(&chunk[..4]);
@@ -329,7 +336,17 @@ impl Receiver {
 
         if let Some(cand) = best_ready {
             let hist = self.modem.rrc.taps.len().saturating_sub(1) as u64;
-            let start_abs = cand.base_abs.saturating_sub(hist);
+            let min_delay = cand
+                .offsets
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(0)
+                .min(0)
+                .unsigned_abs() as u64;
+            let start_abs = cand
+                .arrival_abs
+                .saturating_sub(hist.saturating_add(min_delay));
             let len = (cand.need_abs - start_abs) as usize;
             if self
                 .signal
@@ -338,7 +355,7 @@ impl Receiver {
                 .is_some()
             {
                 let y = &self.signal.win_buf;
-                let frame_start_sample = (cand.base_abs - start_abs) as usize;
+                let frame_start_sample = (cand.arrival_abs - start_abs) as usize;
                 let (payload, meta) = self
                     .modem
                     .demod_decode_raw(
@@ -448,11 +465,9 @@ impl Receiver {
             return Ok(());
         }
 
-        let max_batch = 5000u64;
-        let mut ti_end = next_ti + max_batch;
-        if ti_end > ti_latest {
-            ti_end = ti_latest;
-        }
+        let mut ti_end = next_ti
+            .saturating_add(ACQ_MAX_BATCH_TIS.saturating_sub(1))
+            .min(ti_latest);
 
         let n_start_f = ((next_ti as f64) * self.p.iv_res_s() - t0) * self.state.fs;
         let n_start = n_start_f.round().max(0.0) as u64;
@@ -521,9 +536,10 @@ impl Receiver {
         {
             Ok(Some(acq)) => {
                 if self.state.acq.last_decoded_ti != Some(acq.ti_hat) {
-                    let base_abs = n_start + (acq.ti_hat - next_ti) * self.state.iv_samples;
-                    let max_off = acq.finger_offsets.iter().copied().max().unwrap_or(acq.n0) as u64;
-                    let decode_need_abs = base_abs
+                    let arrival_abs = n_start + acq.arrival_sample as u64;
+                    let max_off =
+                        acq.finger_offsets.iter().copied().max().unwrap_or(0).max(0) as u64;
+                    let decode_need_abs = arrival_abs
                         + max_off
                         + (self.p.frame_max_samples_with_jitter() as u64)
                         + (4 * self.modem.rrc.delay() as u64)
@@ -534,7 +550,7 @@ impl Receiver {
 
                     let cand = Pending {
                         ti: acq.ti_hat,
-                        base_abs,
+                        arrival_abs,
                         offsets: acq.finger_offsets,
                         cfo_hz: acq.cfo_hat_hz,
                         p_max: acq.p_max,
@@ -549,24 +565,24 @@ impl Receiver {
                     if update {
                         if self.args.debug {
                             eprintln!(
-                                "[rx_tcp][dbg] acq candidate: ti_hat={}, n0={}, p_max={:.3e}, cfo={:.2}Hz, fingers={:?}, base_abs={} (decode_in~{:.1}s)",
+                                "[rx_tcp][dbg] acq candidate: ti_hat={}, arrival_sample={}, p_max={:.3e}, cfo={:.2}Hz, finger_delays={:?}, arrival_abs={} (decode_in~{:.1}s)",
                                 acq.ti_hat,
-                                acq.n0,
+                                acq.arrival_sample,
                                 acq.p_max,
                                 acq.cfo_hat_hz,
                                 cand.offsets,
-                                base_abs,
+                                arrival_abs,
                                 decode_in_s
                             );
                         } else {
                             eprintln!(
-                                "[rx_tcp] acq: ti_hat={}, n0={}, p_max={:.3e}, cfo={:.2}Hz, fingers={:?}, base_abs={} (decode_in~{:.1}s)",
+                                "[rx_tcp] acq: ti_hat={}, arrival_sample={}, p_max={:.3e}, cfo={:.2}Hz, finger_delays={:?}, arrival_abs={} (decode_in~{:.1}s)",
                                 acq.ti_hat,
-                                acq.n0,
+                                acq.arrival_sample,
                                 acq.p_max,
                                 acq.cfo_hat_hz,
                                 cand.offsets,
-                                base_abs,
+                                arrival_abs,
                                 decode_in_s
                             );
                         }

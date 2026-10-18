@@ -20,8 +20,8 @@ use num_complex::Complex32;
 use sc_bltc::modem::ScBltcModem;
 use sc_bltc::params::Params;
 use sc_bltc::sim::channel::{
-    apply_channel_sample, build_random_multipath, normalize_taps, parse_mp_tap, ChannelState,
-    DopplerOu, Gauss, MultipathFir, Rng64,
+    apply_channel_sample, build_random_multipath, normalize_taps, parse_mp_tap, resample_linear,
+    ChannelState, DopplerOu, Gauss, MultipathFir, Rng64,
 };
 use std::collections::VecDeque;
 use std::io;
@@ -72,7 +72,7 @@ struct Args {
     cfo_hz: f64,
 
     /// Sampling-rate offset between the stream's *actual* sample clock and the declared Fs (ppm).
-    /// Positive values send samples slightly faster than Fs (clock runs fast).
+    /// Positive values resample the frame to a faster clock and pace samples faster than Fs.
     #[arg(long, default_value_t = 0.0)]
     sro_ppm: f64,
 
@@ -439,6 +439,7 @@ impl Transmitter {
         if fs_actual_hz <= 0.0 {
             anyhow::bail!("fs_actual_hz must be positive (check --sro_ppm)");
         }
+        let sample_rate_ratio = fs_actual_hz / fs_nom_hz;
         let iv_samples = (fs_nom_hz * self.p.iv_res_s()).round() as u64;
 
         let mut tx = TcpDelay::new(stream, Duration::from_millis(self.args.tcp_delay_ms));
@@ -554,12 +555,23 @@ impl Transmitter {
                 .context("build_frame_samples")?;
 
             eprintln!(
-                "[tx_tcp] frame={} ti_tx={} iv_off_samp={} t_frame={:.6}",
-                frame_idx, frame.ti_tx, n_off, t_frame
+                "[tx_tcp] frame={} ti_tx={} iv_off_samp={} t_frame={:.6} samples={} actual_samples={}",
+                frame_idx,
+                frame.ti_tx,
+                n_off,
+                t_frame,
+                frame.samples.len(),
+                (frame.samples.len().saturating_sub(1) as f64 * sample_rate_ratio).floor() as usize
+                    + 1
             );
 
+            // The modem builds the waveform at the declared sample rate. A real clock
+            // offset changes both the emitted sample count and the fractional sample
+            // positions; pacing alone would only change TCP timing and would leave the
+            // waveform at the nominal rate.
+            let frame_samples = resample_linear(&frame.samples, sample_rate_ratio)?;
             let mut tmp = Vec::with_capacity(2048);
-            for &x in &frame.samples {
+            for x in frame_samples {
                 tmp.push(apply_channel_sample(
                     x,
                     self.args.amp,

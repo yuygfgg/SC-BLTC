@@ -31,6 +31,28 @@ fn end_to_end_ideal_frame() -> anyhow::Result<()> {
 }
 
 #[test]
+fn demod_refines_reference_arrival_without_changing_finger_delays() -> anyhow::Result<()> {
+    let p = Params::default();
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
+    let frame = modem.build_frame_samples(b"refine", 1, 1, Some(1000.0))?;
+
+    let lead = 32usize;
+    let mut rx = vec![Complex32::new(0.0, 0.0); lead];
+    rx.extend_from_slice(&frame.samples);
+    rx.extend(std::iter::repeat_n(
+        Complex32::new(0.0, 0.0),
+        2 * modem.rrc.delay() + 16,
+    ));
+
+    // The supplied reference arrival is two samples late. Refinement must move the
+    // reference sample and keep the relative RAKE delay at zero.
+    let (pl, meta) = modem.demod_decode_raw(&rx, frame.ti_tx, lead + 2, &[0], 0.0, 8)?;
+    assert!(meta.crc_ok, "meta={meta:?}");
+    assert_eq!(pl.as_deref(), Some(b"refine".as_slice()));
+    Ok(())
+}
+
+#[test]
 fn end_to_end_with_known_cfo() -> anyhow::Result<()> {
     let p = Params::default();
     let modem = ScBltcModem::new(p, [0u8; 32])?;
@@ -61,7 +83,7 @@ fn end_to_end_with_known_cfo() -> anyhow::Result<()> {
 
 #[test]
 fn acquisition_fft_then_decode() -> anyhow::Result<()> {
-    // Spec §4.B.1 (epoch-internal offset).
+    // Spec §4.B.1 (receiver arrival sample).
     let p = Params::default();
     let modem = ScBltcModem::new(p, [0u8; 32])?;
 
@@ -88,7 +110,7 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
     let n_ti = 5usize;
     let rake_search_half = ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
     let frame_max = p.frame_max_samples_with_jitter();
-    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    let win_need = n_ti * iv_samples + 2 * rake_search_half + frame_max + 64;
     if raw.len() < win_need {
         raw.extend(std::iter::repeat_n(
             Complex32::new(0.0, 0.0),
@@ -101,12 +123,12 @@ fn acquisition_fft_then_decode() -> anyhow::Result<()> {
         .acquire_fft_raw_window(x_win, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx);
-    assert_eq!(acq.n0, n0);
+    assert_eq!(acq.arrival_sample, base + n0);
 
     let (pl, meta) = modem.demod_decode_raw(
         &raw,
         acq.ti_hat,
-        base,
+        acq.arrival_sample,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
         16,
@@ -145,7 +167,7 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
     let n_ti = 5usize;
     let rake_search_half = ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
     let frame_max = p.frame_max_samples_with_jitter();
-    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    let win_need = n_ti * iv_samples + 2 * rake_search_half + frame_max + 64;
     if raw.len() < win_need {
         raw.extend(std::iter::repeat_n(
             Complex32::new(0.0, 0.0),
@@ -158,13 +180,16 @@ fn acquisition_fft_large_cfo_then_decode() -> anyhow::Result<()> {
         .acquire_fft_raw_window(x_win, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx);
-    assert!((acq.n0 as isize - n0 as isize).abs() <= 3, "acq={acq:?}");
+    assert!(
+        (acq.arrival_sample as isize - (base + n0) as isize).abs() <= 3,
+        "acq={acq:?}"
+    );
     assert!((acq.cfo_hat_hz - cfo_hz).abs() <= 50.0, "acq={acq:?}");
 
     let (pl, meta) = modem.demod_decode_raw(
         &raw,
         acq.ti_hat,
-        base,
+        acq.arrival_sample,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
         16,
@@ -244,7 +269,7 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
     let n_ti = 5usize;
     let rake_search_half = ((p.fs_hz() as f64) * p.rake_search_half_s()).round() as usize;
     let frame_max = p.frame_max_samples_with_jitter();
-    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    let win_need = n_ti * iv_samples + 2 * rake_search_half + frame_max + 64;
     if raw.len() < win_need {
         raw.extend(std::iter::repeat_n(
             Complex32::new(0.0, 0.0),
@@ -257,12 +282,15 @@ fn end_to_end_with_random_doppler() -> anyhow::Result<()> {
         .acquire_fft_raw_window(x_win, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx);
-    assert!((acq.n0 as isize - n0 as isize).abs() <= 3, "acq={acq:?}");
+    assert!(
+        (acq.arrival_sample as isize - (base + n0) as isize).abs() <= 3,
+        "acq={acq:?}"
+    );
 
     let (pl, meta) = modem.demod_decode_raw(
         &raw,
         acq.ti_hat,
-        base,
+        acq.arrival_sample,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
         32,
@@ -277,8 +305,8 @@ fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
     let p = Params::default();
     let modem = ScBltcModem::new(p, [0u8; 32])?;
 
-    let path1_amp: f32 = 1.0;
-    let path2_amp: f32 = 0.9;
+    let path1_amp: f32 = 0.9;
+    let path2_amp: f32 = 1.0;
     let noise_std: f32 = 0.15;
 
     let fs = p.fs_hz() as f64;
@@ -326,7 +354,7 @@ fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
     let n_ti = 5usize;
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
     let frame_max = p.frame_max_samples_with_jitter();
-    let win_need = n_ti * iv_samples + rake_search_half + frame_max + 64;
+    let win_need = n_ti * iv_samples + 2 * rake_search_half + frame_max + 64;
     if raw.len() < win_need {
         raw.extend(std::iter::repeat_n(
             Complex32::new(0.0, 0.0),
@@ -339,23 +367,27 @@ fn acquisition_finds_multipath_beyond_one_iv() -> anyhow::Result<()> {
         .acquire_fft_raw_window(x_win, ti_min, n_ti, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx);
-    assert!((acq.n0 as isize - n0 as isize).abs() <= 3, "acq={acq:?}");
+    assert!(acq.arrival_sample >= base + n0, "acq={acq:?}");
 
-    let want = n0 + path2_delay_samples;
+    let want = -(path2_delay_samples as isize);
     assert!(
         acq.finger_offsets
             .iter()
-            .any(|&off| (off as isize - want as isize).abs() <= 2),
-        "expected a finger near {}, got {:?} (n0={})",
+            .any(|&off| (off - want).abs() <= 2),
+        "expected a relative finger delay near {}, got {:?}",
         want,
         acq.finger_offsets,
-        n0
+    );
+    assert!(
+        acq.finger_offsets.iter().any(|&off| off < 0),
+        "the reference path must permit an earlier multipath finger: {:?}",
+        acq.finger_offsets
     );
 
     let (pl, meta) = modem.demod_decode_raw(
         &raw,
         acq.ti_hat,
-        base,
+        acq.arrival_sample,
         &acq.finger_offsets,
         acq.cfo_hat_hz,
         32,

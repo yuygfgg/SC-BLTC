@@ -19,8 +19,8 @@
 //! ```text
 //! Rx (Specification §4)
 //! raw samples
-//!   -> blind acquisition (TI search x intra-epoch offset x CFO via FFT)
-//!   -> coarse results: (ti_hat, n0, cfo_hat, finger_offsets)
+//!   -> blind acquisition (TI search x receiver arrival sample x CFO via FFT)
+//!   -> coarse results: (ti_hat, arrival_sample, cfo_hat, relative finger delays)
 //!   -> matched filter + per-symbol PLL/DLL + RAKE/MRC combining
 //!   -> Walsh matched filtering (FHT1024) -> soft LLR
 //!   -> deinterleave -> CA-SCL polar decode -> parse Header/Payload/CRC

@@ -40,7 +40,8 @@ fn decode_awgn_noise_std_6_single_seed() -> anyhow::Result<()> {
     let pre = base + n0_true;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let pad_post = 512usize;
     let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx_frame.samples.len() + pad_post];
@@ -59,7 +60,7 @@ fn decode_awgn_noise_std_6_single_seed() -> anyhow::Result<()> {
 
     eprintln!("acq={acq:?}");
 
-    let frame_start_sample = base; // epoch start; add n0 via offsets
+    let frame_start_sample = acq.arrival_sample;
     let (payload, meta) = modem.demod_decode_raw(
         &raw,
         ti_tx,

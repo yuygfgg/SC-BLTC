@@ -45,7 +45,7 @@ cargo run --release --bin tx -- [parameters]
 | `--lead-s`               | `0.5`            | Initial silence before the first frame (seconds)           |
 | `--gap-s`                | `0.1`            | Extra silence between frames (seconds)                     |
 | `--cfo-hz`               | `0.0`            | Simulated carrier frequency offset (Hz)                    |
-| `--sro-ppm`              | `0.0`            | Sampling-rate offset (ppm). Positive values = fast clock   |
+| `--sro-ppm`              | `0.0`            | Sampling-rate offset (ppm). The frame waveform is resampled and paced at the actual clock; positive values = fast clock |
 | `--doppler-std-hz`       | `0.0`            | Random Doppler stddev (Hz)                                 |
 | `--doppler-tau-s`        | `0.5`            | Doppler correlation time constant (seconds)                |
 | `--doppler-max-hz`       | `0.0`            | Clamp absolute Doppler to this value (Hz)                  |

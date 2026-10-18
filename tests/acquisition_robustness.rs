@@ -16,7 +16,8 @@ fn test_acquire_on_noise() {
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
 
     let n_ti = 1;
-    let window_len = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let window_len =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let mut rng = StdRng::seed_from_u64(0);
     let n01 = Normal::<f32>::new(0.0, 1.0).unwrap();
@@ -56,7 +57,8 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     let n0 = (frac * fs).round() as usize % iv_samples;
     let pre = base + n0;
 
-    let win_need = n_ti * iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
     let mut raw = vec![Complex32::new(0.0, 0.0); win_need];
 
     let mut rng = StdRng::seed_from_u64(1);
@@ -82,7 +84,7 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
 
     assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}, ti_tx={ti_tx}");
     assert!(
-        (acq.n0 as isize - n0 as isize).abs() <= 3,
+        (acq.arrival_sample as isize - (base + n0) as isize).abs() <= 3,
         "acq={acq:?}, n0_true={n0}"
     );
     assert!(
@@ -93,19 +95,18 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_acquisition_keeps_frame_start_inside_time_index_epoch() -> anyhow::Result<()> {
+fn test_acquisition_separates_time_index_from_delayed_arrival() -> anyhow::Result<()> {
     let p = Params::default();
     let modem = ScBltcModem::new(p, [0u8; 32])?;
     let ti_tx = 5000u64;
     let fs = p.fs_hz() as f64;
     let iv_samples = (fs * p.iv_res_s()).round() as usize;
-    let primary_start = iv_samples - 4;
-    let delayed_start = iv_samples + 8;
-    let t_tx = ti_tx as f64 * p.iv_res_s() + (primary_start as f64) / fs;
-    let frame = modem.build_frame_samples(b"epoch", 1, 1, Some(t_tx))?;
+    let t_tx = ti_tx as f64 * p.iv_res_s() + 4.0 / fs;
+    let frame = modem.build_frame_samples(b"delay", 1, 1, Some(t_tx))?;
+    let arrival_sample = 2 * iv_samples + 8;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let window_len = iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let window_len = iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
 
     let mut rng = StdRng::seed_from_u64(7);
     let n01 = Normal::<f32>::new(0.0, 0.01)?;
@@ -113,11 +114,8 @@ fn test_acquisition_keeps_frame_start_inside_time_index_epoch() -> anyhow::Resul
         .map(|_| Complex32::new(n01.sample(&mut rng), n01.sample(&mut rng)))
         .collect();
     for (i, &sample) in frame.samples.iter().enumerate() {
-        if primary_start + i < raw.len() {
-            raw[primary_start + i] += sample;
-        }
-        if delayed_start + i < raw.len() {
-            raw[delayed_start + i] += 2.0 * sample;
+        if arrival_sample + i < raw.len() {
+            raw[arrival_sample + i] += sample;
         }
     }
 
@@ -126,11 +124,26 @@ fn test_acquisition_keeps_frame_start_inside_time_index_epoch() -> anyhow::Resul
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}");
     assert!(
-        acq.n0 < iv_samples,
-        "frame start escaped TI epoch: n0={}, iv_samples={}, acq={acq:?}",
-        acq.n0,
+        acq.arrival_sample >= 2 * iv_samples,
+        "arrival sample was incorrectly tied to TI epoch: arrival={}, iv_samples={}, acq={acq:?}",
+        acq.arrival_sample,
         iv_samples
     );
+    assert!(
+        (acq.arrival_sample as isize - arrival_sample as isize).abs() <= 3,
+        "arrival estimate does not match the independent receiver arrival: expected={}, acq={acq:?}",
+        arrival_sample
+    );
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        acq.ti_hat,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        16,
+    )?;
+    assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
+    assert_eq!(payload.as_deref(), Some(b"delay".as_slice()));
     Ok(())
 }
 
