@@ -34,6 +34,8 @@ The following global parameters are predefined:
 \item $K_{\text{sec}}$ (Shared Secret Key): A 256-bit key, pre-shared between the transmitter and receiver.
 \item $T_{\text{epoch}}$ (Time Epoch): Defined as the Unix Epoch (1970-01-01 00:00:00 UTC).
 \item $\mathit{IV}_{\text{res}}$ (Time Counter Resolution): Defines the time granularity for generating the spreading code seed, fixed at $1\,\text{ms}$.
+  A TimeIndex $\mathit{TI}$ represents the half-open time interval
+  $[\mathit{TI}\cdot\mathit{IV}_{\text{res}},(\mathit{TI}+1)\cdot\mathit{IV}_{\text{res}})$.
 \item \textbf{TimeIndex Search Window}: The TimeIndex hypothesis set is
   \[
     \mathcal{T}=\{\mathit{TI}_{\min},\mathit{TI}_{\min}+1,\dots,\mathit{TI}_{\min}+N_{\mathit{TI}}-1\}.
@@ -463,10 +465,20 @@ Define the intra-epoch sample period
 \[
   N_{\text{IV,samp}}=\mathrm{round}(F_s\cdot \mathit{IV}_{\text{res}}).
 \]
+For each $\mathit{TI}\in\mathcal{T}$, define the start of its interval in the acquisition
+window as
+\[
+  b(\mathit{TI})=(\mathit{TI}-\mathit{TI}_{\min})\,N_{\text{IV,samp}}.
+\]
 Define the coarse frame-start hypothesis set (samples)
 \[
   \mathcal{N}_{\text{coarse}}=\{0, N_{\text{off,stride}}, 2N_{\text{off,stride}}, \dots\}\cap [0, N_{\text{IV,samp}}).
 \]
+For a hypothesis $(\mathit{TI},n_0)$, the nominal frame start is
+$b(\mathit{TI})+n_0$.  The receiver shall test a hypothesis only when
+$n_0\in[0,N_{\text{IV,samp}})$; therefore the nominal signal start is always inside the
+one-millisecond interval represented by the tested $\mathit{TI}$.  A start in a neighboring
+interval shall be tested with that neighboring TimeIndex and its own generated code.
 
 \subsubsection{Step B.2: Coarse Preamble Metric and Coarse CFO Estimate}
 
@@ -563,11 +575,21 @@ with tie-break by smaller $(\mathit{TI},n_0)$.
 
 \subsubsection{Step B.4: Timing Refinement and RAKE Finger Set}
 
-Define the timing-refinement window (samples)
+Define the timing-refinement window for the nominal frame start (samples)
 \[
-  \mathcal{W}=\left\{\hat n_{\text{coarse}}-N_{\text{rake}},\dots,\hat n_{\text{coarse}}+N_{\text{rake}}\right\}.
+  \mathcal{W}=\left\{\hat n:\max(0,\hat n_{\text{coarse}}-N_{\text{rake}})\le \hat n
+  \le \min(N_{\text{IV,samp}}-1,\hat n_{\text{coarse}}+N_{\text{rake}})\right\}.
 \]
-For each $\hat n\in\mathcal{W}$, define the two coherent preamble correlations
+The refined nominal frame start shall remain in this interval.  A
+later RAKE finger can be outside this interval when it represents a delayed multipath path; it
+does not change the TimeIndex or the nominal frame start.
+For RAKE search, define the valid timing window
+\[
+  \mathcal{W}_{\text{rake}}=\left\{\hat n:\max(0,\hat n_{\text{coarse}}-N_{\text{rake}})\le \hat n
+  \le \hat n_{\text{coarse}}+N_{\text{rake}}\right\},
+\]
+after removing positions for which the required preamble samples are not available.  For each
+$\hat n\in\mathcal{W}_{\text{rake}}$, define the two coherent preamble correlations
 \[
   z_0(\hat n)=\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x[\hat n+n]\cdot s_0^*[n],
 \]
@@ -584,11 +606,14 @@ The refined main-path start is
 \]
 with tie-break by smaller $\hat n$.
 
-Define the local-maximum set
+Define the local-maximum set over the valid RAKE window
 \[
-  \mathcal{M}=\left\{\hat n\in\mathcal{W}:\ \Lambda(\hat n)\ge \Lambda(\hat n-1)\ \wedge\ \Lambda(\hat n)>\Lambda(\hat n+1)\right\},
+  \mathcal{M}=\left\{\hat n\in\mathcal{W}_{\text{rake}}:\ \Lambda(\hat n)\ge \Lambda(\hat n-1)\ \wedge\ \Lambda(\hat n)>\Lambda(\hat n+1)\right\},
 \]
-with boundary cases interpreted by restricting to valid indices in $\mathcal{W}$. Define $\mathcal{M}_+=\{\hat n\in\mathcal{M}:\hat n\ge \hat n_0\}$.
+with boundary cases interpreted by restricting to valid indices in $\mathcal{W}_{\text{rake}}$. Define $\mathcal{M}_+=\{\hat n\in\mathcal{M}:\hat n\ge \hat n_0\}$.
+The constraint $\hat n_0\in\mathcal{W}$ applies to the nominal frame start only.  A selected
+finger in $\mathcal{M}_+$ may be later than $N_{\text{IV,samp}}-1$ when it represents a delayed
+multipath path; such a finger does not change the TimeIndex interval of $\hat n_0$.
 
 Define the (unordered) RAKE finger set as any maximizer of
 \[
@@ -613,11 +638,18 @@ Define the candidate shift set $\Delta\mathcal{N}=\{-N_{\Delta n},\dots,+N_{\Del
 \[
   \rho(0)=0,\quad \rho(-d)=2d-1,\quad \rho(+d)=2d,\quad d=1,\dots,N_{\Delta n}.
 \]
-For each $\Delta n\in\Delta\mathcal{N}$, define the candidate frame start $\hat n_{\text{frm}}(\Delta n)=\hat n_0+\Delta n$ and shifted finger starts $\hat n_{\text{finger},i}(\Delta n)=\hat n_{\text{finger},i}+\Delta n$.
+Define the valid frame-start shifts
+\[
+  \Delta\mathcal{N}_{\text{epoch}}=\left\{\Delta n\in\Delta\mathcal{N}:0\le \hat n_0+\Delta n<N_{\text{IV,samp}}\right\}.
+\]
+Only shifts in $\Delta\mathcal{N}_{\text{epoch}}$ shall be decoded for this TimeIndex.  For each
+$\Delta n\in\Delta\mathcal{N}_{\text{epoch}}$, define the candidate frame start
+$\hat n_{\text{frm}}(\Delta n)=\hat n_0+\Delta n$ and shifted finger starts
+$\hat n_{\text{finger},i}(\Delta n)=\hat n_{\text{finger},i}+\Delta n$.
 
 Let $\hat U(\Delta n)$ be the decoded information bits produced by applying Steps~C--D with frame start $\hat n_{\text{frm}}(\Delta n)$ and finger starts $\{\hat n_{\text{finger},i}(\Delta n)\}$. Let $\mathrm{CRC}(\hat U(\Delta n))\in\{0,1\}$ be the CRC-32C verification result.
 
-Define the CRC-valid set $\Delta\mathcal{N}_{\text{crc}}=\{\Delta n\in\Delta\mathcal{N}:\mathrm{CRC}(\hat U(\Delta n))=1\}$. If $\Delta\mathcal{N}_{\text{crc}}\neq\emptyset$, then
+Define the CRC-valid set $\Delta\mathcal{N}_{\text{crc}}=\{\Delta n\in\Delta\mathcal{N}_{\text{epoch}}:\mathrm{CRC}(\hat U(\Delta n))=1\}$. If $\Delta\mathcal{N}_{\text{crc}}\neq\emptyset$, then
 \[
   \Delta n^\star=\arg\min_{\Delta n\in\Delta\mathcal{N}_{\text{crc}}}\rho(\Delta n).
 \]
@@ -634,7 +666,7 @@ with
 \]
 where $\mathbf{u}_{i,\ell}[j]$ is defined in Step~C.4 and $z_\ell$ is defined in Step~C.5. The selected shift is
 \[
-  \Delta n^\star=\arg\max_{\Delta n\in\Delta\mathcal{N}} V(\Delta n),
+  \Delta n^\star=\arg\max_{\Delta n\in\Delta\mathcal{N}_{\text{epoch}}} V(\Delta n),
 \]
 with tie-break by smaller $\rho(\Delta n)$.
 

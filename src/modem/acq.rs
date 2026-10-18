@@ -20,7 +20,7 @@
 //! ```text
 //! rx_window = [ IV(ti_min) | IV(ti_min+1) | ... ]
 //! base(ti)  = (ti - ti_min) * iv_samples
-//! start     = base(ti) + off
+//! start     = base(ti) + off, where `off` is restricted to `[0 .. iv_samples)`
 //! ```
 
 use super::{AcqResult, ScBltcModem};
@@ -659,7 +659,8 @@ impl ScBltcModem {
         // Spec §4.B.3
         // Coordinate system note: all `off`/`n0`/`finger_offsets` values are nonnegative sample
         // offsets from the start of the acquired IV epoch (the `ti_hat` boundary). The nominal
-        // "symmetric" +/- search window is therefore clipped to `[0, max_off]` at the low end.
+        // frame start `n0` must stay in that epoch. The symmetric search window is clipped to
+        // `[0, max_off]` at the low end; a delayed multipath finger may extend beyond the epoch.
         let center = best.off as isize;
         let half = ctx.rake_search_half_samples as isize;
         let mut off_lo: isize = center - half;
@@ -707,7 +708,17 @@ impl ScBltcModem {
         // Sort by descending correlation energy, tie-break by smaller offset.
         corr.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        let n0 = corr.first().map(|v| v.0).unwrap_or(best.off);
+        // `best.off` is an intra-epoch hypothesis, so the nominal frame start must stay in
+        // the same IV interval as `best.ti`.  The timing window may also contain delayed paths
+        // from a later interval; those paths can be RAKE fingers, but they cannot become the
+        // frame start for this TimeIndex.
+        let epoch_last = ctx.iv_samples.saturating_sub(1);
+        let n0 = corr
+            .iter()
+            .find(|(off, _)| *off <= epoch_last)
+            .map(|v| v.0)
+            .unwrap_or(best.off.min(epoch_last));
+        debug_assert!(n0 <= epoch_last);
 
         let min_sep = (p.osf() as usize).max(1);
         // Keep the best (strongest) finger first; downstream code treats this as the frame's

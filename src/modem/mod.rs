@@ -38,11 +38,17 @@ pub struct TxFrame {
 pub struct AcqResult {
     /// Estimated transmit `TimeIndex` seed (`TI_tx`).
     pub ti_hat: u64,
-    /// Sample offset (>=0) from the start of the acquired IV epoch `ti_hat`.
+    /// Nominal frame-start offset (>=0) from the start of the acquired IV epoch `ti_hat`.
+    ///
+    /// The offset is always smaller than the sample count for one IV epoch, so the frame start
+    /// remains inside the 1 ms interval represented by `ti_hat`.
     pub n0: usize,
     /// Estimated CFO in Hz (coarse+refined).
     pub cfo_hat_hz: f64,
     /// RAKE finger start offsets (>=0) in the same coordinate system as `n0`.
+    ///
+    /// The first offset is the nominal frame start. Later offsets may exceed one IV epoch when
+    /// they represent delayed multipath paths.
     pub finger_offsets: Vec<usize>,
     /// Verification statistic (larger is better).
     pub p_max: f32,

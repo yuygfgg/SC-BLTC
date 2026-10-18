@@ -943,6 +943,7 @@ impl ScBltcModem {
             derotate_cfo_in_place(&mut x_cfo, p.fs_hz(), cfo_hz);
         }
         let mut x_work = x_cfo.clone();
+        let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as usize;
 
         // With frequency-hopped waveforms, a ±1 sample error in `n0` can introduce large,
         // hop-dependent phase jumps across symbols. Under high noise, acquisition can still
@@ -978,6 +979,11 @@ impl ScBltcModem {
             let n0 = *offs_adj
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("no_offsets"))?;
+            // The first finger is the nominal frame start. Keep it inside the 1 ms epoch
+            // represented by `ti_tx`; delayed multipath fingers may lie beyond this interval.
+            if n0 >= iv_samples {
+                continue;
+            }
             let start = frame_start_sample
                 .checked_add(n0)
                 .ok_or_else(|| anyhow::anyhow!("frame_start overflow"))?;
@@ -1054,6 +1060,10 @@ impl ScBltcModem {
         let p = &self.p;
         if n_offset_total.is_empty() {
             return Ok((None, DecodeMeta::error("no_offsets")));
+        }
+        let iv_samples = ((p.fs_hz() as f64) * p.iv_res_s()).round() as usize;
+        if n_offset_total[0] >= iv_samples {
+            return Ok((None, DecodeMeta::error("frame_start_outside_time_index")));
         }
         let y = y_matched;
 

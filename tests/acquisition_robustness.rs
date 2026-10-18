@@ -92,6 +92,48 @@ fn test_acquire_raw_noise_plus_cfo() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_acquisition_keeps_frame_start_inside_time_index_epoch() -> anyhow::Result<()> {
+    let p = Params::default();
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
+    let ti_tx = 5000u64;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
+    let primary_start = iv_samples - 4;
+    let delayed_start = iv_samples + 8;
+    let t_tx = ti_tx as f64 * p.iv_res_s() + (primary_start as f64) / fs;
+    let frame = modem.build_frame_samples(b"epoch", 1, 1, Some(t_tx))?;
+
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
+    let window_len = iv_samples + rake_search_half + p.frame_max_samples_with_jitter() + 64;
+
+    let mut rng = StdRng::seed_from_u64(7);
+    let n01 = Normal::<f32>::new(0.0, 0.01)?;
+    let mut raw: Vec<Complex32> = (0..window_len)
+        .map(|_| Complex32::new(n01.sample(&mut rng), n01.sample(&mut rng)))
+        .collect();
+    for (i, &sample) in frame.samples.iter().enumerate() {
+        if primary_start + i < raw.len() {
+            raw[primary_start + i] += sample;
+        }
+        if delayed_start + i < raw.len() {
+            raw[delayed_start + i] += 2.0 * sample;
+        }
+    }
+
+    let acq = modem
+        .acquire_fft_raw_window(&raw, ti_tx, 1, 3)?
+        .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
+    assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}");
+    assert!(
+        acq.n0 < iv_samples,
+        "frame start escaped TI epoch: n0={}, iv_samples={}, acq={acq:?}",
+        acq.n0,
+        iv_samples
+    );
+    Ok(())
+}
+
 // #[test]
 // fn test_key_mismatch() {
 //     let p = Params::default();
