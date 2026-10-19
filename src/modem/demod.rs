@@ -8,7 +8,7 @@
 //! This module:
 //! 1) generates the full-frame chip mask `C_seq`
 //! 2) samples chips for each finger with a DLL (early/late gate) and linear interpolation
-//! 3) runs a symbol-rate PLL/Costas loop with a small frequency bank (anti-slip)
+//! 3) performs a local joint timing/carrier search on pilot symbols, then runs the PLL/DLL loops
 //! 4) combines fingers with MRC and performs Walsh matched filtering (FHT1024)
 //! 5) generates soft LLRs, deinterleaves, and CA-SCL decodes the polar code
 //!
@@ -43,6 +43,10 @@ const FREQ_EVIDENCE_DECAY: f64 = 0.95;
 const FREQ_EVIDENCE_MIN_SYMBOLS: usize = 4;
 const FREQ_SNAP_EVIDENCE_MIN: f32 = 0.05;
 const MAX_DEMOD_FINGERS: usize = 3;
+const JOINT_TIMING_RADIUS_SAMP: f64 = 1.5;
+const JOINT_TIMING_STEP_SAMP: f64 = 0.5;
+const JOINT_TIMING_MIN_GAIN: f32 = 0.005;
+const JOINT_FREQ_BLEND: f64 = 0.1;
 
 struct SymbolBuffers {
     u_p_fingers: Vec<Vec<Complex32>>,
@@ -87,6 +91,39 @@ struct SymbolProcOutcome {
     dll_update: Option<DllUpdate>,
 }
 
+/// Coupled carrier and timing state used by the symbol tracker.
+///
+/// The carrier loop and the DLL still use their own loop gains, but they now
+/// share one state object. Pilot updates can therefore apply a timing
+/// correction and a frequency correction from the same matched-filter metric.
+struct JointTrackingState {
+    dll: EarlyLateDll,
+    theta: f64,
+    omega: f64,
+    // Common timing state. `t_sym0` stores the corresponding absolute times per finger.
+    timing_offset_samp: f64,
+}
+
+impl JointTrackingState {
+    fn new(dll: EarlyLateDll, theta: f64, omega: f64) -> Self {
+        Self {
+            dll,
+            theta,
+            omega,
+            timing_offset_samp: 0.0,
+        }
+    }
+
+    fn apply_joint_measurement(&mut self, timing_delta_samp: f64, omega: f64) {
+        if timing_delta_samp.is_finite() {
+            self.timing_offset_samp += timing_delta_samp;
+        }
+        if omega.is_finite() {
+            self.omega = omega;
+        }
+    }
+}
+
 struct SymbolTracker<'a> {
     p: &'a crate::params::Params,
     y: &'a [Complex32],
@@ -97,9 +134,7 @@ struct SymbolTracker<'a> {
     // Integer sample delay relative to finger 0 (main path).
     d_finger_samp: Vec<i32>,
     t_sym0: Vec<f64>,
-    dll: EarlyLateDll,
-    theta: f64,
-    omega: f64,
+    tracking: JointTrackingState,
     omega_lim: f64,
     pll_kp: f64,
     pll_ki: f64,
@@ -197,11 +232,11 @@ impl<'a> SymbolTracker<'a> {
         let w_mrc = Self::mrc_weights(&g);
 
         let (pll_kp, pll_ki, omega_lim) = Self::init_pll(t_update, t_data);
-        let omega = 0.0f64;
+        let tracking = JointTrackingState::new(dll, theta, 0.0);
 
         let (bank_dhz, bank_domega, bank_step_hz) = Self::init_freq_bank(t_data);
         let bank_len = bank_dhz.len();
-        let pre_mag_ref = Self::preamble_mag_ref(p, n_finger, &u0_fingers, &w_mrc, theta);
+        let pre_mag_ref = Self::preamble_mag_ref(p, n_finger, &u0_fingers, &w_mrc, tracking.theta);
         let alpha_ch = 1.0 / (p.n_pilot() as f64);
         let verify_pre: f64 = pre_corr.iter().map(|z| z.norm_sqr() as f64).sum();
 
@@ -214,9 +249,7 @@ impl<'a> SymbolTracker<'a> {
             n_finger,
             d_finger_samp,
             t_sym0,
-            dll,
-            theta,
-            omega,
+            tracking,
             omega_lim,
             pll_kp,
             pll_ki,
@@ -558,7 +591,7 @@ impl<'a> SymbolTracker<'a> {
     }
 
     fn rebase_frequency_likelihood(&mut self) {
-        let center_hz = self.omega / (2.0 * std::f64::consts::PI * self.t_data);
+        let center_hz = self.tracking.omega / (2.0 * std::f64::consts::PI * self.t_data);
         let old_center_hz = self.freq_likelihood_center_hz;
         if !center_hz.is_finite()
             || !old_center_hz.is_finite()
@@ -631,6 +664,98 @@ impl<'a> SymbolTracker<'a> {
         *theta = wrap_pm_pi(*theta + (kp * scale) * err);
     }
 
+    /// Search timing and carrier hypotheses from the same pilot correlation.
+    ///
+    /// The existing DLL and PLL correct one dimension at a time. A sample-rate
+    /// error changes both dimensions over the frame, so a pilot can be stronger
+    /// at a nearby timing and frequency pair than at either independent loop's
+    /// current point. This small local search supplies one coupled measurement;
+    /// the regular DLL and PLL then continue with their normal loop updates.
+    fn apply_joint_pilot_search(&mut self, ell: usize, chip_step: f64) -> anyhow::Result<()> {
+        if !is_pilot(ell) || self.n_finger == 0 {
+            return Ok(());
+        }
+
+        let p = self.p;
+        let sf = p.sf();
+        let f_hz = *self.f_seq_hz.get(ell).unwrap_or(&0.0);
+        let fs_hz = p.fs_hz() as f64;
+        let n_steps = (JOINT_TIMING_RADIUS_SAMP / JOINT_TIMING_STEP_SAMP).round() as i32;
+        let mut best_score = f32::NEG_INFINITY;
+        let mut center_score = f32::NEG_INFINITY;
+        let mut best_shift = 0.0f64;
+        let mut best_omega = self.tracking.omega;
+
+        for shift_i in -n_steps..=n_steps {
+            let shift = (shift_i as f64) * JOINT_TIMING_STEP_SAMP;
+            self.buffers.u_tmp.fill(Complex32::new(0.0, 0.0));
+            let mut valid = true;
+            for i in 0..self.n_finger {
+                if Self::sample_symbol_into(
+                    self.y,
+                    self.t_sym0[i],
+                    chip_step,
+                    shift,
+                    &mut self.buffers.tmp_e,
+                )
+                .is_none()
+                {
+                    valid = false;
+                    break;
+                }
+                Self::demask_in_place(self.c_seq, sf, ell, &mut self.buffers.tmp_e);
+                let d = self.d_finger_samp.get(i).copied().unwrap_or(0);
+                let rot_d = Self::hop_delay_comp_phasor(f_hz, d, fs_hz);
+                for j in 0..sf {
+                    self.buffers.u_tmp[j] += self.w_mrc[i] * (self.buffers.tmp_e[j] * rot_d);
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            for &domega in &self.bank_domega {
+                let omega_h = (self.tracking.omega + domega).clamp(-self.omega_lim, self.omega_lim);
+                Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.tracking.theta, omega_h);
+                let z: Complex32 = self
+                    .buffers
+                    .u_tmp
+                    .iter()
+                    .zip(&self.buffers.rot_tmp)
+                    .map(|(&u, &rot)| u * rot)
+                    .sum();
+                let score = z.norm_sqr();
+                if shift_i == 0 {
+                    center_score = center_score.max(score);
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_shift = shift;
+                    best_omega = omega_h;
+                }
+            }
+        }
+
+        if best_score.is_finite() && center_score.is_finite() {
+            let gain = (best_score - center_score) / center_score.max(1e-12);
+            let accepted_shift = if gain >= JOINT_TIMING_MIN_GAIN {
+                best_shift
+            } else {
+                0.0
+            };
+            let omega = if accepted_shift != 0.0 {
+                self.tracking.omega + JOINT_FREQ_BLEND * (best_omega - self.tracking.omega)
+            } else {
+                self.tracking.omega
+            };
+            for t in &mut self.t_sym0 {
+                *t += accepted_shift;
+            }
+            self.tracking.apply_joint_measurement(accepted_shift, omega);
+        }
+        Ok(())
+    }
+
     fn process_symbol(
         &mut self,
         ell: usize,
@@ -638,7 +763,8 @@ impl<'a> SymbolTracker<'a> {
         q_data: &mut usize,
     ) -> anyhow::Result<()> {
         let p = self.p;
-        let chip_step = self.dll.sym_step_samp / (p.sf() as f64);
+        let chip_step = self.tracking.dll.sym_step_samp / (p.sf() as f64);
+        self.apply_joint_pilot_search(ell, chip_step)?;
         for i in 0..self.n_finger {
             let buf = &mut self.buffers.u_p_fingers[i];
             Self::sample_symbol_into(self.y, self.t_sym0[i], chip_step, 0.0, buf)
@@ -696,7 +822,7 @@ impl<'a> SymbolTracker<'a> {
             .ok_or_else(|| anyhow::anyhow!("j_seq out of range"))? as f64;
         let gi_samp = j_ell * chip_step;
         for t in &mut self.t_sym0 {
-            *t += self.dll.sym_step_samp + phase_adj + gi_samp;
+            *t += self.tracking.dll.sym_step_samp + phase_adj + gi_samp;
         }
         Ok(())
     }
@@ -708,13 +834,13 @@ impl<'a> SymbolTracker<'a> {
         let omega_lim = self.omega_lim;
         let sf = p.sf();
 
-        let mut omega_used = self.omega;
+        let mut omega_used = self.tracking.omega;
 
         let mut freq_metrics = vec![0.0f32; self.bank_domega.len()];
         let mut best_v = f32::NEG_INFINITY;
         for (h, &domega) in self.bank_domega.iter().enumerate() {
-            let omega_h = (self.omega + domega).clamp(-self.omega_lim, self.omega_lim);
-            Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.theta, omega_h);
+            let omega_h = (self.tracking.omega + domega).clamp(-self.omega_lim, self.omega_lim);
+            Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.tracking.theta, omega_h);
 
             self.buffers.u_tmp.fill(Complex32::new(0.0, 0.0));
             for j in 0..p.sf() {
@@ -740,13 +866,18 @@ impl<'a> SymbolTracker<'a> {
         // Cycle-slip guard.
         let mut z_p: Complex32 = self.buffers.u_best.iter().copied().sum();
         if (z_p.re as f64) < 0.0 && z_p.norm() > 0.25 * self.pre_mag_ref {
-            self.theta = wrap_pm_pi(self.theta + std::f64::consts::PI);
+            self.tracking.theta = wrap_pm_pi(self.tracking.theta + std::f64::consts::PI);
             for gi in &mut self.g {
                 *gi = -*gi;
             }
             self.w_mrc = Self::mrc_weights(&self.g);
 
-            Self::fill_rot_chips(&mut self.buffers.rot_best, sf, self.theta, omega_used);
+            Self::fill_rot_chips(
+                &mut self.buffers.rot_best,
+                sf,
+                self.tracking.theta,
+                omega_used,
+            );
             self.buffers.u_best.fill(Complex32::new(0.0, 0.0));
             for j in 0..sf {
                 let rotj = self.buffers.rot_best[j];
@@ -765,11 +896,11 @@ impl<'a> SymbolTracker<'a> {
 
         let err = (z_p.im as f64).atan2((z_p.re as f64) + 1e-18);
         let sym_scale = 1.0 + (self.j_seq[ell] as f64) / (p.sf() as f64);
-        Self::pll_predict(&mut self.theta, omega_used, sym_scale);
+        Self::pll_predict(&mut self.tracking.theta, omega_used, sym_scale);
         if err.is_finite() && z_p.norm() > 1e-6 {
             Self::pll_correct(
-                &mut self.theta,
-                &mut self.omega,
+                &mut self.tracking.theta,
+                &mut self.tracking.omega,
                 err,
                 false,
                 kp,
@@ -811,15 +942,15 @@ impl<'a> SymbolTracker<'a> {
         let sf = p.sf();
         let mw = p.mw();
 
-        let mut omega_used = self.omega;
+        let mut omega_used = self.tracking.omega;
 
         let mut best_i = 0usize;
         let mut freq_metrics = vec![0.0f32; self.bank_domega.len()];
         let mut best_v = f32::NEG_INFINITY;
         let mut best_code_conf = 0.0f32;
         for (h, &domega) in self.bank_domega.iter().enumerate() {
-            let omega_h = (self.omega + domega).clamp(-self.omega_lim, self.omega_lim);
-            Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.theta, omega_h);
+            let omega_h = (self.tracking.omega + domega).clamp(-self.omega_lim, self.omega_lim);
+            Self::fill_rot_chips(&mut self.buffers.rot_tmp, sf, self.tracking.theta, omega_h);
 
             self.buffers.u_tmp.fill(Complex32::new(0.0, 0.0));
             for j in 0..p.sf() {
@@ -865,7 +996,7 @@ impl<'a> SymbolTracker<'a> {
         }
 
         let sym_scale = 1.0 + (self.j_seq[ell] as f64) / (p.sf() as f64);
-        Self::pll_predict(&mut self.theta, omega_used, sym_scale);
+        Self::pll_predict(&mut self.tracking.theta, omega_used, sym_scale);
         let mut rot_llr: Option<Complex32> = None;
         let dll_update = if data_conf.is_finite() && data_conf > 0.10 {
             let mut z_dd = self.buffers.r_best[best_i];
@@ -875,8 +1006,8 @@ impl<'a> SymbolTracker<'a> {
             let err = (z_dd.im as f64).atan2((z_dd.re as f64) + 1e-18);
             if err.is_finite() && z_dd.norm() > 1e-6 {
                 Self::pll_correct(
-                    &mut self.theta,
-                    &mut self.omega,
+                    &mut self.tracking.theta,
+                    &mut self.tracking.omega,
                     err,
                     true,
                     kp,
@@ -959,16 +1090,16 @@ impl<'a> SymbolTracker<'a> {
         }
         if self.snap_count >= self.freq_snap_confirm {
             let snap_hz = self.snap_cand_hz.unwrap_or(0.0);
-            let center_hz = self.omega / (2.0 * std::f64::consts::PI * self.t_data);
+            let center_hz = self.tracking.omega / (2.0 * std::f64::consts::PI * self.t_data);
             let correction_hz = snap_hz - center_hz;
             if snap_hz.abs() >= self.freq_snap_min_abs_hz {
-                self.omega = (self.omega
+                self.tracking.omega = (self.tracking.omega
                     + 2.0 * std::f64::consts::PI * correction_hz * self.t_data)
                     .clamp(-self.omega_lim, self.omega_lim);
             }
             self.freq_likelihood.fill(0.0);
             self.freq_likelihood_center_hz =
-                self.omega / (2.0 * std::f64::consts::PI * self.t_data);
+                self.tracking.omega / (2.0 * std::f64::consts::PI * self.t_data);
             self.freq_evidence_symbols = 0;
             self.snap_cand_hz = None;
             self.snap_count = 0;
@@ -1034,7 +1165,7 @@ impl<'a> SymbolTracker<'a> {
         let err_samp = (e as f64) * (el_shift / 2.0);
         let mut phase_adj = 0.0f64;
         if err_samp.is_finite() && den > 1e-6 {
-            phase_adj = self.dll.update(err_samp, update.dd);
+            phase_adj = self.tracking.dll.update(err_samp, update.dd);
         }
         Ok(phase_adj)
     }

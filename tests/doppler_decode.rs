@@ -4,7 +4,9 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use sc_bltc::modem::ScBltcModem;
 use sc_bltc::params::Params;
-use sc_bltc::sim::channel::resample_linear;
+use sc_bltc::sim::channel::{
+    apply_channel_sample, normalize_taps, resample_linear, ChannelState, Gauss, MultipathFir, Rng64,
+};
 
 fn apply_ou_doppler_and_awgn(
     x: &[Complex32],
@@ -371,5 +373,70 @@ fn test_decode_with_sampling_rate_offset() -> anyhow::Result<()> {
     )?;
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"sro".as_slice()));
+    Ok(())
+}
+
+#[test]
+fn test_decode_with_joint_tracking_sro_and_multipath() -> anyhow::Result<()> {
+    let p = Params::default();
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
+    let t_tx = 4000.0f64 + 4.0 / fs;
+    let frame = modem.build_frame_samples(b"joint", 1, 1, Some(t_tx))?;
+    let ti_tx = frame.ti_tx;
+    let ti_min = ti_tx.saturating_sub(2);
+    let n_ti = 5usize;
+    let base = ((ti_tx - ti_min) as usize) * iv_samples;
+    let pre = base + 4;
+    let sro_ppm = 300.0f64;
+    let tx = resample_linear(&frame.samples, 1.0 + sro_ppm * 1e-6)?;
+
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 128;
+    let mut raw = vec![Complex32::new(0.0, 0.0); pre + tx.len() + 512];
+    raw[pre..pre + tx.len()].copy_from_slice(&tx);
+    raw.resize(raw.len().max(win_need), Complex32::new(0.0, 0.0));
+
+    let mut taps = vec![Complex32::new(0.0, 0.0); 101];
+    taps[0] = Complex32::new(1.0, 0.0);
+    taps[40] = Complex32::new(10.0f32.powf(-3.0 / 20.0), 0.0);
+    taps[100] = Complex32::new(10.0f32.powf(-8.0 / 20.0), 0.0);
+    let mut channel = ChannelState::new(Some(MultipathFir::new(normalize_taps(taps))?), None);
+    let mut rng = Rng64::new(1);
+    let mut gauss = Gauss::new();
+    let raw: Vec<_> = raw
+        .into_iter()
+        .map(|x| {
+            apply_channel_sample(
+                x,
+                1.0,
+                0.0,
+                fs * (1.0 + sro_ppm * 1e-6),
+                0.0,
+                &mut channel,
+                &mut rng,
+                &mut gauss,
+            )
+        })
+        .collect();
+
+    let acq = modem
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
+        .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        20,
+    )?;
+    assert!(
+        meta.crc_ok,
+        "joint tracking failed: meta={meta:?}, acq={acq:?}"
+    );
+    assert_eq!(payload.as_deref(), Some(b"joint".as_slice()));
     Ok(())
 }

@@ -108,6 +108,7 @@ The following global parameters are predefined:
   \item Post-acquisition arrival-sample refinement window: $N_{\Delta n}=6$ samples (i.e.\ $\Delta n\in[-6,6]$).
   \item Maximum number of tracking/combining fingers: $N_{\text{finger,max}}=3$.
   \item Carrier-tracking frequency bank: $\Delta f_h \in \{-4.0,-3.75,\dots,+4.0\}\,\text{Hz}$ with step $0.25\,\text{Hz}$.
+  \item Joint pilot timing search: $\delta\in[-1.5,+1.5]$ samples with $0.5$-sample spacing. Accept a timing candidate when its normalized score gain is at least $0.005$; blend its frequency state with weight $0.1$.
   \item Carrier-tracking frequency limit: $f_{\text{PLL,max}}=200\,\text{Hz}$.
   \item Frequency-bank likelihood memory: exponential decay $\lambda_{\text{freq}}=0.95$, minimum evidence history $N_{\text{freq,min}}=4$ symbols, and cumulative snap margin $\Gamma_{\text{freq}}=0.05$.
   \item Frequency-snap confirmation: $f_{\text{snap,tol}}=0.125\,\text{Hz}$, $N_{\text{snap}}=3$, and $f_{\text{snap,min}}=0.75\,\text{Hz}$.
@@ -759,7 +760,10 @@ For each spread symbol $\ell$, the data segment length is $\mathit{SF}$ chips an
 
 \subsubsection{Step C.4: Despreading and MRC Combining}
 
-Define the common timing correction state $\tau_\ell$ (samples) with initialization $\tau_0=0$ and update $\tau_{\ell+1}=\tau_\ell+\Delta t_\ell$, where $\Delta t_\ell$ is defined by the DLL in Step~C.6.
+Define the common timing correction state $\tau_\ell$ (samples) with initialization $\tau_0=0$ and update
+$\tau_{\ell+1}=\tau_\ell+\delta_\ell^{\mathrm{joint}}+\Delta t_\ell$, where the joint pilot correction
+$\delta_\ell^{\mathrm{joint}}$ is defined in Step~C.7 and $\Delta t_\ell$ is defined by the DLL in
+Step~C.6. For non-pilot symbols, $\delta_\ell^{\mathrm{joint}}=0$.
 
 Define the tracked symbol start time for finger $i$ and symbol $\ell$ (samples)
 \[
@@ -1034,6 +1038,48 @@ define the timing updates
 \]
 
 Fixed DLL values: $B_L=0.6\,\text{Hz}$, $\zeta=0.707$ with the same pole-mapping definitions as the PLL.
+
+\subsubsection{Step C.7: Joint Pilot Carrier and Timing Update}
+
+The receiver stores one joint tracking state
+\[
+  S_\ell=(\tau_\ell,\mathit{step}_\ell,\theta_\ell,\omega_\ell),
+\]
+where $\tau_\ell$ is the common timing offset, $\mathit{step}_\ell$ is the
+samples-per-symbol state, and $(\theta_\ell,\omega_\ell)$ is the carrier state.
+The state starts with $\tau_0=0$, the nominal sample step, and the preamble carrier estimate.
+
+Before the normal PLL and DLL update on a pilot symbol, define the local timing candidates
+\[
+  \mathcal{D}=\{-1.5,-1.0,-0.5,0,0.5,1.0,1.5\}\ \text{samples}.
+\]
+For each $\delta\in\mathcal{D}$ and each carrier-bank hypothesis $h$, sample every finger at
+$t_{i,\ell}+\delta$, apply the de-spreading and hop-delay compensation rules in Step~C.4,
+and combine the fingers with the current MRC weights. Define
+\[
+  Q_{\ell}(\delta,h)=\left|\sum_{j=0}^{\mathit{SF}-1}
+      \mathbf{u}_{\ell,\delta}[j]\,r_{\ell,h}[j]\right|^2.
+\]
+Let $(\delta^\star,h^\star)$ maximize $Q_\ell$. Let $Q_{\ell,0}$ be the largest score
+among the hypotheses with $\delta=0$. Define the normalized gain
+\[
+  G_\ell=\frac{Q_\ell(\delta^\star,h^\star)-Q_{\ell,0}}
+                 {\max(Q_{\ell,0},\epsilon)}.
+\]
+If $G_\ell\ge 0.005$, accept $\delta_\ell^{\mathrm{joint}}=\delta^\star$; otherwise set
+$\delta_\ell^{\mathrm{joint}}=0$. Update the common timing state and all finger symbol times by
+\[
+  \tau_\ell\leftarrow\tau_\ell+\delta_\ell^{\mathrm{joint}}.
+\]
+When a non-zero timing correction is accepted, update the carrier frequency state with a
+one-tenth blend of the selected bank hypothesis:
+\[
+  \omega_\ell\leftarrow\omega_\ell+0.1\left(\omega_{\ell,h^\star}-\omega_\ell\right).
+\]
+When the timing candidate is rejected, keep $\omega_\ell$ unchanged. The receiver then runs
+the regular carrier update in Step~C.5 and the early/late DLL update in Step~C.6. This ordering
+keeps the joint search local while allowing the existing loops to remove residual phase and
+timing error.
 
 \subsection{Step D: Walsh Demodulation and Polar (CA-SCL) Decoding}
 
