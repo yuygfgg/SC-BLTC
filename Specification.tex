@@ -552,7 +552,21 @@ Define a noise power estimate from the raw baseband samples
   \widehat{\sigma^2} = \frac{\mathrm{median}(|x[n]|^2)}{\ln 2}.
 \]
 
-Pilot symbol indices are defined by $\ell_{\text{pilot}}(r)=2+5r$, $r=0,\dots,N_{\text{pilot}}-1$. For each pilot $r$, let $p_r[n]$ be the locally generated TX-shaped, hopped pilot reference waveform for the pilot's $1024$-chip data segment. Define the pilot verification energy
+Pilot symbol indices are defined by $\ell_{\text{pilot}}(r)=2+5r$, $r=0,\dots,N_{\text{pilot}}-1$. For each pilot $r$, let $p_r[n]$ be the locally generated TX-shaped, hopped pilot reference waveform for the pilot's $1024$-chip data segment.
+
+The pilot verification stage needs samples only through the end of the last pilot data segment. Let
+\[
+  \ell_{\text{last,pilot}}=2+5(N_{\text{pilot}}-1).
+\]
+For a candidate arrival sample $a$, the maximum-jitter sample span needed by this stage is
+\[
+  N_{\text{acq,max}}=\left[\ell_{\text{last,pilot}}(\mathit{SF}+j_{\max})+\mathit{SF}\right]\cdot\mathit{OSF}+N_{\text{pilot,win}},
+\]
+where $j_{\max}=90$ chips for the defined jitter range. The span is measured from $a$.
+The receiver SHALL NOT require the remaining data symbols or the optional transmit tail to
+complete acquisition. The receiver MAY wait for the data-symbol span before starting Steps~C--D.
+
+Define the pilot verification energy
 \[
   E_r(\mathit{TI},a)=\max_{\Delta n\in[-N_{\text{pilot,win}},N_{\text{pilot,win}}]}\left|\sum_{n=0}^{\mathit{SF}\cdot\mathit{OSF}-1} x\!\left[a+n_{\ell_{\text{pilot}}(r)}+\Delta n+n\right]\cdot p_r^*[n]\cdot e^{-j2\pi\widehat{\Delta f}(\mathit{TI},a)\,n/F_s}\right|^2,
 \]
@@ -1037,7 +1051,10 @@ define the timing updates
   \Delta t_\ell = -(K_p^{\text{DLL}} s_{\text{dd}}^{\text{DLL}})\,e_{\text{DLL},\ell}.
 \]
 
-Fixed DLL values: $B_L=0.6\,\text{Hz}$, $\zeta=0.707$ with the same pole-mapping definitions as the PLL.
+Fixed DLL damping is $\zeta=0.707$ with the same pole-mapping definitions as the PLL. Use
+$B_L=2.0\,\text{Hz}$ for a single selected finger and $B_L=0.6\,\text{Hz}$ when RAKE
+combining uses two or more selected fingers. The wider single-finger loop follows sampling-rate
+offset; the narrower multi-finger loop limits timing jitter from delayed paths.
 
 \subsubsection{Step C.7: Joint Pilot Carrier and Timing Update}
 

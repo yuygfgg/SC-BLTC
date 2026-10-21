@@ -308,12 +308,12 @@ impl ScBltcModem {
         }
 
         let pilot_timing_win: isize = 32;
-        let frame_max = p.frame_max_samples_with_jitter();
+        let acquisition_max = p.acquisition_max_samples_with_jitter();
         let need = n_ti
             .checked_mul(iv_samples)
             .and_then(|v| v.checked_add(arrival_search_half_samples))
             .and_then(|v| v.checked_add(rake_search_half_samples))
-            .and_then(|v| v.checked_add(frame_max))
+            .and_then(|v| v.checked_add(acquisition_max))
             .and_then(|v| v.checked_add(32))
             .ok_or_else(|| anyhow::anyhow!("window_size_overflow"))?;
         if rx_window.len() < need {

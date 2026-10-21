@@ -66,10 +66,8 @@ cargo run --release --bin tx -- [parameters]
 | :------------------ | :--------------- | :------------------------------------------------ |
 | `--bind`            | `127.0.0.1:5555` | Bind address                                      |
 | `--key-hex`         | `00..00`         | 32-byte key in hex                                |
-| `--ldpc-maxiter`    | `500`            | LDPC max iterations                               |
+| `--scl-list-size`   | `16`             | CA-SCL list size for Polar decoding               |
 | `--w-sec`           | `0.5`            | Blind acquisition time window W (seconds)         |
-| `--p-fa-total`      | `1e-9`           | CFAR target false-alarm probability               |
-| `--n-finger`        | `3`              | Number of RAKE fingers to initialize              |
 | `--buffer-sec`      | `30.0`           | Ring buffer length in seconds                     |
 | `--acq-interval-ms` | `250`            | How often to attempt acquisition (milliseconds)   |
 | `--read-timeout-ms` | `0`              | TCP read timeout in milliseconds (0 = no timeout) |

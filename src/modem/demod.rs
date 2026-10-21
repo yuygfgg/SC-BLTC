@@ -47,6 +47,9 @@ const JOINT_TIMING_RADIUS_SAMP: f64 = 1.5;
 const JOINT_TIMING_STEP_SAMP: f64 = 0.5;
 const JOINT_TIMING_MIN_GAIN: f32 = 0.005;
 const JOINT_FREQ_BLEND: f64 = 0.1;
+const DLL_BW_SINGLE_PATH_HZ: f64 = 2.0;
+const DLL_BW_RAKE_HZ: f64 = 0.6;
+const DLL_DAMPING: f64 = 0.707;
 
 struct SymbolBuffers {
     u_p_fingers: Vec<Vec<Complex32>>,
@@ -200,7 +203,7 @@ impl<'a> SymbolTracker<'a> {
         // Symbol update period (includes guard/noise) used for loop-gain design.
         let j_avg = (p.jitter_min_chips() as f64) + 0.5 * (p.jitter_span_chips() as f64);
         let t_update = ((p.sf() as f64) + j_avg) / (p.rc_chip_sps() as f64);
-        let dll = Self::init_dll(p, t_update);
+        let dll = Self::init_dll(p, t_update, n_finger);
         let chip_step0 = dll.sym_step_samp / (p.sf() as f64);
 
         let (mut u0_fingers, mut u1_fingers) = Self::sample_initial_fingers(
@@ -339,10 +342,18 @@ impl<'a> SymbolTracker<'a> {
         t_sym0
     }
 
-    fn init_dll(p: &crate::params::Params, tsym: f64) -> EarlyLateDll {
-        let dll_g = design_2nd_order_loop(0.6, 0.707, tsym);
+    fn init_dll(p: &crate::params::Params, tsym: f64, n_finger: usize) -> EarlyLateDll {
+        // A single-path channel has a clean early/late discriminator and needs more
+        // bandwidth to follow a sampling-rate offset. Multipath combines several
+        // delayed discriminators, so retain the narrower loop when RAKE combining is active.
+        let loop_bw_hz = if n_finger <= 1 {
+            DLL_BW_SINGLE_PATH_HZ
+        } else {
+            DLL_BW_RAKE_HZ
+        };
+        let dll_g = design_2nd_order_loop(loop_bw_hz, DLL_DAMPING, tsym);
         let sym_step_nom = (p.sf() as f64) * (p.osf() as f64);
-        let sym_step_ppm = 2000.0;
+        let sym_step_ppm = crate::params::MAX_SRO_PPM;
         let sym_step_min = sym_step_nom * (1.0 - sym_step_ppm * 1e-6);
         let sym_step_max = sym_step_nom * (1.0 + sym_step_ppm * 1e-6);
         EarlyLateDll {

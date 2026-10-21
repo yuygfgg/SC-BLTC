@@ -6,10 +6,22 @@
 //! - demodulation/decoding under CFO and simple multipath
 
 use super::*;
+use crate::params::MAX_SRO_PPM;
 use num_complex::Complex32;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
+
+#[test]
+fn frame_body_span_covers_max_positive_sro() {
+    let modem = ScBltcModem::new(Params::default(), [0u8; 32]).unwrap();
+    let ti = 4_000_000;
+    let nominal = modem.frame_body_samples_for_ti(ti);
+    let expected = ((nominal as f64) * (1.0 + MAX_SRO_PPM * 1e-6)).ceil() as usize;
+
+    assert_eq!(modem.frame_body_samples_for_ti_with_max_sro(ti), expected);
+    assert!(expected > nominal);
+}
 
 #[test]
 fn end_to_end_ideal_frame() -> anyhow::Result<()> {

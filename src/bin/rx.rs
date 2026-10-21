@@ -13,7 +13,7 @@ use num_complex::Complex32;
 use sc_bltc::modem::ScBltcModem;
 use sc_bltc::params::Params;
 use sc_bltc::ring::Ring;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -105,8 +105,14 @@ struct DebugStats {
 
 struct AcquisitionState {
     last_acq: Instant,
-    last_decoded_ti: Option<u64>,
+    decoded_tis: HashSet<u64>,
     search_cursor_ti: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum AcquisitionPass {
+    Scheduled,
+    EndOfStream,
 }
 
 struct SignalBuffer {
@@ -150,12 +156,12 @@ impl Receiver {
         let rake_search_half_samples: u64 = ((p.fs_hz() as f64) * p.rake_search_half_s())
             .round()
             .max(0.0) as u64;
-        let frame_max = p.frame_max_samples_with_jitter() as u64;
+        let acquisition_max = p.acquisition_max_samples_with_jitter() as u64;
         let arrival_search_half_samples = ((p.fs_hz() as f64) * p.arrival_search_half_s())
             .round()
             .max(0.0) as u64;
         let acq_guard_samples =
-            arrival_search_half_samples + rake_search_half_samples + frame_max + 64;
+            arrival_search_half_samples + rake_search_half_samples + acquisition_max + 64;
         let acq_tail_samples = acq_guard_samples.saturating_add(iv_samples);
 
         let cap_samples = (args.buffer_sec.max(1.0) * fs).round() as usize;
@@ -183,7 +189,7 @@ impl Receiver {
                 acq_tail_samples,
                 acq: AcquisitionState {
                     last_acq: Instant::now() - Duration::from_secs(3600),
-                    last_decoded_ti: None,
+                    decoded_tis: HashSet::new(),
                     search_cursor_ti: None,
                 },
                 dbg: DebugStats {
@@ -315,13 +321,31 @@ impl Receiver {
         self.state.dbg.pwr_sum = 0.0;
     }
 
+    fn prune_decoded_tis(&mut self) {
+        let Some(t0) = self.state.t0_s else {
+            return;
+        };
+        let ti_floor = ((t0 + (self.signal.ring.abs_base() as f64) / self.state.fs)
+            / self.p.iv_res_s())
+        .ceil()
+        .max(0.0) as u64;
+        self.state.acq.decoded_tis.retain(|&ti| ti >= ti_floor);
+    }
+
     fn process_pending(&mut self) -> anyhow::Result<()> {
+        self.prune_decoded_tis();
+        self.signal
+            .pending
+            .retain(|ti, _| !self.state.acq.decoded_tis.contains(ti));
         if self.signal.pending.is_empty() {
             return Ok(());
         }
 
         let mut best_ready: Option<Pending> = None;
         for cand in self.signal.pending.values() {
+            if self.state.acq.decoded_tis.contains(&cand.ti) {
+                continue;
+            }
             if self.signal.ring.abs_next() < cand.need_abs {
                 continue;
             }
@@ -382,7 +406,7 @@ impl Receiver {
                         cand.cfo_hz,
                         cand.offsets
                     );
-                    self.state.acq.last_decoded_ti = Some(cand.ti);
+                    self.state.acq.decoded_tis.insert(cand.ti);
                 } else {
                     eprintln!(
                         "[rx_tcp] decode failed (crc_ok={}, err={:?}, ver={}, type={}, len={}, ti_tx={}, p_max={:.3e}, cfo={:.2}Hz, offsets={:?})",
@@ -404,25 +428,29 @@ impl Receiver {
         Ok(())
     }
 
-    fn run_acquisition(&mut self) -> anyhow::Result<()> {
-        if self.state.acq.last_acq.elapsed() < Duration::from_millis(self.args.acq_interval_ms) {
-            return Ok(());
+    fn run_acquisition(&mut self, pass: AcquisitionPass) -> anyhow::Result<bool> {
+        self.prune_decoded_tis();
+        let end_of_stream = matches!(pass, AcquisitionPass::EndOfStream);
+        if !end_of_stream
+            && self.state.acq.last_acq.elapsed() < Duration::from_millis(self.args.acq_interval_ms)
+        {
+            return Ok(false);
         }
-        if self.signal.ring.len() <= self.state.acq_tail_samples {
-            return Ok(());
+        let tail_samples = if end_of_stream {
+            self.state.acq_guard_samples
+        } else {
+            self.state.acq_tail_samples
+        };
+        if self.signal.ring.len() <= tail_samples {
+            return Ok(false);
         }
         let Some(t0) = self.state.t0_s else {
-            return Ok(());
+            return Ok(false);
         };
 
         self.state.acq.last_acq = Instant::now();
         let t_latest = t0
-            + ((self
-                .signal
-                .ring
-                .abs_next()
-                .saturating_sub(self.state.acq_tail_samples)) as f64)
-                / self.state.fs;
+            + ((self.signal.ring.abs_next().saturating_sub(tail_samples)) as f64) / self.state.fs;
         let ti_latest_i = (t_latest / self.p.iv_res_s()).floor() as i64;
         let ti_earliest_i = ((t0 + (self.signal.ring.abs_base() as f64) / self.state.fs)
             / self.p.iv_res_s())
@@ -432,12 +460,14 @@ impl Receiver {
         let mut ti_earliest = ti_earliest_i.max(0) as u64;
         if ti_latest < ti_earliest {
             self.state.acq.search_cursor_ti = Some(ti_earliest);
-            return Ok(());
+            return Ok(false);
         }
 
-        let w_ti = ((self.args.w_sec / self.p.iv_res_s()).ceil().max(1.0)) as u64;
-        let ti_floor = ti_latest.saturating_sub(w_ti);
-        ti_earliest = ti_earliest.max(ti_floor);
+        if !end_of_stream {
+            let w_ti = ((self.args.w_sec / self.p.iv_res_s()).ceil().max(1.0)) as u64;
+            let ti_floor = ti_latest.saturating_sub(w_ti);
+            ti_earliest = ti_earliest.max(ti_floor);
+        }
 
         if self.state.acq.search_cursor_ti.is_none() {
             self.state.acq.search_cursor_ti = Some(ti_earliest);
@@ -462,7 +492,7 @@ impl Receiver {
 
         if next_ti > ti_latest {
             self.state.acq.search_cursor_ti = Some(next_ti);
-            return Ok(());
+            return Ok(false);
         }
 
         let mut ti_end = next_ti
@@ -476,12 +506,12 @@ impl Receiver {
             let delta_samp = self.signal.ring.abs_base() - n_start;
             let delta_ti = delta_samp.div_ceil(self.state.iv_samples);
             self.state.acq.search_cursor_ti = Some(next_ti.saturating_add(delta_ti));
-            return Ok(());
+            return Ok(true);
         }
 
-        if n_start.saturating_add(self.state.acq_tail_samples) > self.signal.ring.abs_next() {
+        if n_start.saturating_add(tail_samples) > self.signal.ring.abs_next() {
             self.state.acq.search_cursor_ti = Some(next_ti);
-            return Ok(());
+            return Ok(false);
         }
 
         let max_n_ti_by_end = {
@@ -517,7 +547,7 @@ impl Receiver {
                 );
             }
             self.state.acq.search_cursor_ti = Some(next_ti + 1);
-            return Ok(());
+            return Ok(true);
         }
         let y_win = &self.signal.win_buf;
 
@@ -535,13 +565,16 @@ impl Receiver {
             .acquire_fft_raw_window(y_win, next_ti, n_ti, ACQ_N_FINGER)
         {
             Ok(Some(acq)) => {
-                if self.state.acq.last_decoded_ti != Some(acq.ti_hat) {
+                if !self.state.acq.decoded_tis.contains(&acq.ti_hat) {
                     let arrival_abs = n_start + acq.arrival_sample as u64;
                     let max_off =
                         acq.finger_offsets.iter().copied().max().unwrap_or(0).max(0) as u64;
                     let decode_need_abs = arrival_abs
                         + max_off
-                        + (self.p.frame_max_samples_with_jitter() as u64)
+                        + (self
+                            .modem
+                            .frame_body_samples_for_ti_with_max_sro(acq.ti_hat)
+                            as u64)
                         + (4 * self.modem.rrc.delay() as u64)
                         + 256;
                     let decode_in_s = (decode_need_abs.saturating_sub(self.signal.ring.abs_next())
@@ -626,7 +659,21 @@ impl Receiver {
             );
         }
         self.state.acq.search_cursor_ti = Some(ti_end + 1);
-        Ok(())
+        Ok(true)
+    }
+
+    fn drain_after_eof(&mut self) -> anyhow::Result<()> {
+        // A finite stream can end before the normal W-second scheduler revisits the frame.
+        // Rewind the cursor and scan retained samples once without the scheduler or W limit.
+        self.state.acq.search_cursor_ti = None;
+        loop {
+            let progressed = self.run_acquisition(AcquisitionPass::EndOfStream)?;
+            self.process_pending()?;
+            if !progressed {
+                break;
+            }
+        }
+        self.process_pending()
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
@@ -645,9 +692,10 @@ impl Receiver {
             }
             self.maybe_log_debug();
             self.process_pending()?;
-            self.run_acquisition()?;
+            let _ = self.run_acquisition(AcquisitionPass::Scheduled)?;
         }
 
+        self.drain_after_eof()?;
         eprintln!("[rx_tcp] connection closed");
         Ok(())
     }
@@ -655,4 +703,33 @@ impl Receiver {
 
 fn main() -> anyhow::Result<()> {
     Receiver::new(Args::parse())?.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_tis_are_removed_from_pending() -> anyhow::Result<()> {
+        let mut receiver = Receiver::new(Args::parse_from(["rx", "--buffer-sec", "1"]))?;
+        receiver.state.t0_s = Some(4000.0);
+        let ti = 4_000_000;
+        receiver.state.acq.decoded_tis.insert(ti);
+        receiver.signal.pending.insert(
+            ti,
+            Pending {
+                ti,
+                arrival_abs: 0,
+                offsets: vec![0],
+                cfo_hz: 0.0,
+                p_max: 1.0,
+                need_abs: 0,
+            },
+        );
+
+        receiver.process_pending()?;
+
+        assert!(receiver.signal.pending.is_empty());
+        Ok(())
+    }
 }

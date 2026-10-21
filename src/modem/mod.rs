@@ -12,7 +12,8 @@
 //! - `acq`: blind time/CFO acquisition via FFT (Specification §4.B)
 //! - `demod`: RAKE + PLL/DLL tracking + Walsh/FEC decoding (Specification §4.C-§4.D)
 
-use crate::params::Params;
+use crate::crypto::{gen_code_structured_aes_ctr, JitterSpec};
+use crate::params::{Params, MAX_SRO_PPM};
 use crate::rrc::{rrc_taps, Fir};
 use num_complex::Complex32;
 use rustfft::Fft;
@@ -122,6 +123,42 @@ impl ScBltcModem {
             fft_acq,
             fft_acq_scratch_len,
         })
+    }
+
+    /// Return the exact sample span of the frame body for a transmit time index.
+    ///
+    /// The decoder processes the preamble, pilots, and data symbols. The transmit tail is only
+    /// filter settling time, so callers that schedule decoding should use this span instead of
+    /// the full padded frame length.
+    pub fn frame_body_samples_for_ti(&self, ti: u64) -> usize {
+        let p = &self.p;
+        let g = gen_code_structured_aes_ctr(
+            &self.key,
+            ti,
+            p.n_sym(),
+            p.sf(),
+            p.domain_u32(),
+            p.hop_bw_hz(),
+            JitterSpec {
+                min_chips: p.jitter_min_chips(),
+                span_chips: p.jitter_span_chips(),
+            },
+        );
+        let chips = g
+            .j_seq_chips
+            .iter()
+            .take(p.n_sym())
+            .fold(0usize, |total, &j| total.saturating_add(p.sf() + j));
+        chips.saturating_mul(p.osf() as usize)
+    }
+
+    /// Return the frame-body span with enough room for the maximum positive SRO.
+    ///
+    /// A positive transmitter sampling-rate offset stretches the received frame. The receiver
+    /// must retain the complete stretched body before it starts decoding.
+    pub fn frame_body_samples_for_ti_with_max_sro(&self, ti: u64) -> usize {
+        let nominal = self.frame_body_samples_for_ti(ti) as f64;
+        (nominal * (1.0 + MAX_SRO_PPM * 1e-6)).ceil() as usize
     }
 }
 

@@ -106,7 +106,12 @@ fn test_acquisition_separates_time_index_from_delayed_arrival() -> anyhow::Resul
     let arrival_sample = 2 * iv_samples + 8;
 
     let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
-    let window_len = iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let acq_window_len = iv_samples
+        + (fs * p.arrival_search_half_s()).round() as usize
+        + rake_search_half
+        + p.acquisition_max_samples_with_jitter()
+        + 32;
+    let window_len = (arrival_sample + frame.samples.len() + 64).max(acq_window_len);
 
     let mut rng = StdRng::seed_from_u64(7);
     let n01 = Normal::<f32>::new(0.0, 0.01)?;
@@ -120,7 +125,7 @@ fn test_acquisition_separates_time_index_from_delayed_arrival() -> anyhow::Resul
     }
 
     let acq = modem
-        .acquire_fft_raw_window(&raw, ti_tx, 1, 3)?
+        .acquire_fft_raw_window(&raw[..acq_window_len], ti_tx, 1, 3)?
         .ok_or_else(|| anyhow::anyhow!("acq_failed"))?;
     assert_eq!(acq.ti_hat, ti_tx, "acq={acq:?}");
     assert!(

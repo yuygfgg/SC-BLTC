@@ -56,6 +56,41 @@ fn apply_ou_doppler_and_awgn(
     y
 }
 
+fn decode_sro_case(sro_ppm: f64) -> anyhow::Result<()> {
+    let p = Params::default();
+    let modem = ScBltcModem::new(p, [0u8; 32])?;
+    let fs = p.fs_hz() as f64;
+    let iv_samples = (fs * p.iv_res_s()).round() as usize;
+    let t_tx = 4000.0 + 4.0 / fs;
+    let frame = modem.build_frame_samples(b"sro", 1, 1, Some(t_tx))?;
+    let ti_min = frame.ti_tx.saturating_sub(2);
+    let n_ti = 5usize;
+    let base = ((frame.ti_tx - ti_min) as usize) * iv_samples;
+    let tx = resample_linear(&frame.samples, 1.0 + sro_ppm * 1e-6)?;
+    let pre = base + 4;
+    let rake_search_half = (fs * p.rake_search_half_s()).round() as usize;
+    let win_need =
+        n_ti * iv_samples + 2 * rake_search_half + p.frame_max_samples_with_jitter() + 64;
+    let mut raw = vec![Complex32::new(0.0, 0.0); win_need.max(pre + tx.len() + 512)];
+    raw[pre..pre + tx.len()].copy_from_slice(&tx);
+
+    let acq = modem
+        .acquire_fft_raw_window(&raw[..win_need], ti_min, n_ti, 3)?
+        .ok_or_else(|| anyhow::anyhow!("acq_failed at sro_ppm={sro_ppm}"))?;
+    assert_eq!(acq.ti_hat, frame.ti_tx, "sro_ppm={sro_ppm}, acq={acq:?}");
+    let (payload, meta) = modem.demod_decode_raw(
+        &raw,
+        frame.ti_tx,
+        acq.arrival_sample,
+        &acq.finger_offsets,
+        acq.cfo_hat_hz,
+        20,
+    )?;
+    assert!(meta.crc_ok, "sro_ppm={sro_ppm}, meta={meta:?}, acq={acq:?}");
+    assert_eq!(payload.as_deref(), Some(b"sro".as_slice()));
+    Ok(())
+}
+
 #[test]
 fn test_decode_with_doppler_ou() -> anyhow::Result<()> {
     let p = Params::default();
@@ -373,6 +408,14 @@ fn test_decode_with_sampling_rate_offset() -> anyhow::Result<()> {
     )?;
     assert!(meta.crc_ok, "decode failed: meta={meta:?}, acq={acq:?}");
     assert_eq!(payload.as_deref(), Some(b"sro".as_slice()));
+    Ok(())
+}
+
+#[test]
+fn test_decode_with_extreme_sampling_rate_offsets() -> anyhow::Result<()> {
+    for sro_ppm in [-500.0, 350.0, 500.0] {
+        decode_sro_case(sro_ppm)?;
+    }
     Ok(())
 }
 

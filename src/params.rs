@@ -9,6 +9,9 @@
 //! - `*_ms`: milliseconds
 //! - `*_sps`: rate in "per second" (see the field doc for whether it is samples/s or chips/s)
 
+/// Maximum sampling-rate offset tracked by the receiver DLL, in parts per million.
+pub const MAX_SRO_PPM: f64 = 2_000.0;
+
 /// Spec §1.
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -266,5 +269,16 @@ impl Params {
         let per_sym = self.sf + self.jitter_max_chips();
         let chips = self.n_sym * per_sym + self.n_tail * self.sf;
         chips * (self.osf as usize)
+    }
+
+    /// Upper bound on the waveform samples needed to verify a frame during acquisition.
+    ///
+    /// Acquisition checks the preamble and the pilot symbols. The last pilot is at symbol
+    /// index `2 + 5 * (N_pilot - 1)`, so the data symbols and the transmit tail are not needed.
+    /// Callers add the pilot timing-search margin separately.
+    pub fn acquisition_max_samples_with_jitter(&self) -> usize {
+        let last_pilot = self.n_pre + 5 * self.n_pilot.saturating_sub(1);
+        let per_sym = self.sf + self.jitter_max_chips();
+        (last_pilot * per_sym + self.sf) * (self.osf as usize)
     }
 }
